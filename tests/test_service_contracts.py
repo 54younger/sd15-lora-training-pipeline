@@ -91,6 +91,18 @@ def _verified_dataset(client: TestClient, app, *, content: bytes = b"image-bytes
     return dataset["id"]
 
 
+def test_upload_returns_empty_204_on_initial_and_repeated_upload(client: TestClient):
+    content = b"image-bytes"
+    dataset = _create_dataset(client, _file("sample.png", content))
+    path = f"/v1/datasets/{dataset['id']}/files/{dataset['files'][0]['id']}"
+    for _ in range(2):
+        response = client.put(path, headers=ALICE, content=content)
+        assert response.status_code == 204
+        assert response.content == b""
+        assert "content-length" not in response.headers
+        assert "content-type" not in response.headers
+
+
 @pytest.mark.parametrize("caption", ["x" * 513, "caption\x00with-control"])
 def test_dataset_declaration_rejects_unsafe_caption_text(client: TestClient, caption: str):
     response = client.post(

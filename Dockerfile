@@ -1,6 +1,7 @@
 FROM python:3.12-slim-bookworm AS runtime
 ARG TORCH_INDEX_URL=https://download.pytorch.org/whl/cpu
 ENV PYTHONUNBUFFERED=1 PIP_NO_CACHE_DIR=1 \
+    PIP_DEFAULT_TIMEOUT=180 PIP_RETRIES=5 \
     LORA_DATA_DIR=/data HF_HOME=/models HF_HUB_DISABLE_TELEMETRY=1
 RUN useradd --create-home --uid 10001 pipeline \
     && mkdir -p /data /models /app \

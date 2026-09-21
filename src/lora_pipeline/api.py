@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, Header, Request
-from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
+from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, Response
 from pydantic import BaseModel, Field
 
 from .common import PipelineError
@@ -212,7 +212,7 @@ def create_app(settings: Settings):
             Path(temporary).unlink(missing_ok=True)
             raise
         Path(temporary).unlink(missing_ok=True)
-        return JSONResponse(status_code=204, content=None)
+        return Response(status_code=204)
 
     @app.post("/v1/datasets/{dataset_id}/complete", status_code=202)
     async def complete_dataset(
