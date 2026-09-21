@@ -1,0 +1,35 @@
+services:
+  api:
+    build:
+      context: .
+      args:
+        TORCH_INDEX_URL: ${TORCH_INDEX_URL:-https://download.pytorch.org/whl/cpu}
+    image: local-lora-pipeline:0.1.0
+    ports:
+      - "127.0.0.1:8000:8000"
+    environment: &environment
+      LORA_DATA_DIR: /data
+      HF_HOME: /models
+      LORA_API_KEYS: ${LORA_API_KEYS:?Set LORA_API_KEYS to a JSON token-to-owner mapping}
+      LORA_ADMIN_KEYS: ${LORA_ADMIN_KEYS:-[]}
+      LORA_TEST_BACKEND: ${LORA_TEST_BACKEND:-1}
+      LORA_FAKE_SLOTS: ${LORA_FAKE_SLOTS:-1}
+      LORA_GPU_UUIDS: ${LORA_GPU_UUIDS:-}
+    volumes: &volumes
+      - pipeline-data:/data
+      - model-cache:/models
+    restart: unless-stopped
+  worker:
+    image: local-lora-pipeline:0.1.0
+    command: ["lora-pipeline", "worker"]
+    environment: *environment
+    volumes: *volumes
+    healthcheck:
+      test: ["CMD", "lora-pipeline", "worker-health"]
+      interval: 30s
+      timeout: 5s
+      start_period: 40s
+    restart: unless-stopped
+volumes:
+  pipeline-data:
+  model-cache:

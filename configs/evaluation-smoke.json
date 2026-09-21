@@ -1,0 +1,8 @@
+{
+  "prompts": ["a red circle on a white background", "a blue square on a yellow background"],
+  "seeds": [42],
+  "inference_steps": 10,
+  "guidance_scale": 7.5,
+  "device": "cuda",
+  "quality_policy": null
+}

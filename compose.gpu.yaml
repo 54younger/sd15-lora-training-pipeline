@@ -1,0 +1,13 @@
+services:
+  api:
+    build:
+      args:
+        TORCH_INDEX_URL: https://download.pytorch.org/whl/cu128
+    environment:
+      LORA_TEST_BACKEND: "0"
+      LORA_FAKE_SLOTS: "0"
+  worker:
+    environment:
+      LORA_TEST_BACKEND: "0"
+      LORA_FAKE_SLOTS: "0"
+    gpus: all
