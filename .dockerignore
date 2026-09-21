@@ -4,6 +4,7 @@ var
 __pycache__
 .pytest_cache
 .env
+datasets/
 *.zip
 *.egg-info
 .mypy_cache
