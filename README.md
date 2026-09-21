@@ -75,7 +75,9 @@ else
   export DEMO_TOKEN='paste-the-token-from-.env'
 fi
 dc config --quiet
-dc build
+# BuildKit is required for the persistent pip cache mount. This must print a version.
+docker buildx version
+dc build --progress=plain
 dc run --rm --no-deps worker lora-pipeline preflight
 ~~~
 
@@ -148,7 +150,9 @@ prepare 解码和规范化图片，拒绝坏文件、动画、超限和精确重
 # Docker bind mount 的源路径必须是绝对路径，因此这里使用 "$PWD/..." 展开绝对路径。
 export DATASET_DIR="${DATASET_DIR:-$PWD/datasets/ibean/images}"
 test -d "$DATASET_DIR" || { echo "DATASET_DIR does not exist: $DATASET_DIR" >&2; exit 1; }
-dc run --rm --no-deps -i -v "$DATASET_DIR:/input:ro" worker python - <<'PY'
+prepare_ibean_data() {
+# heredoc 通过 stdin 传入脚本；-T 禁用 Compose 默认分配的伪终端，兼容 SSH/CI/重定向执行。
+dc run --rm --no-deps -i -T -v "$DATASET_DIR:/input:ro" worker python - <<'PY'
 import json
 from pathlib import Path
 root = Path("/input")
@@ -158,15 +162,44 @@ if not 100 <= len(paths) <= 1000: raise SystemExit(f"expected 100..1000 images, 
 items = [{"id":f"input-{i:04d}","name":p.name,"path":str(p),"caption":captions.get(p.name)} for i,p in enumerate(paths)]
 Path("/data/real-files.json").write_text(json.dumps(items))
 PY
+# 只有上一步成功后才继续。若这里不存在，先处理上一步输出的首个错误。
+dc run --rm --no-deps -T worker test -f /data/real-files.json || return 1
 export DATA_PREPARATION_STARTED="$(date +%s)"
 dc run --rm --no-deps -v "$DATASET_DIR:/input:ro" worker lora-pipeline prepare \
-  --files /data/real-files.json --output /data/real-prepared
+  --files /data/real-files.json --output /data/real-prepared || return 1
 export DATA_PREPARATION_SECONDS="$(( $(date +%s) - DATA_PREPARATION_STARTED ))"
 printf 'DATA_PREPARATION_SECONDS=%s\n' "$DATA_PREPARATION_SECONDS"
 dc run --rm --no-deps worker lora-pipeline caption \
   --prepared /data/real-prepared/prepared.json --output /data/real-input \
   --mode template --trigger-token mystyle
+}
+prepare_ibean_data
+unset -f prepare_ibean_data
 ~~~
+
+这里的 `/data` 是**容器内路径**，由 Compose 挂载到 `pipeline-data` named volume，并不对应宿主机的 `/data` 目录。因此三个一次性容器会共享生成的 manifest，容器被 `--rm` 删除后文件仍保留在 volume 中，但不能直接在宿主机执行 `ls /data/real-input` 查找。`DATASET_DIR` 只需挂载到读取原图的前两个容器。
+
+确认最终文件存在并只显示摘要：
+
+~~~bash
+dc run --rm --no-deps -T worker python -c '
+import json
+from pathlib import Path
+p = Path("/data/real-input/training-input.json")
+x = json.loads(p.read_text())
+print({"path": str(p), "train": len(x["train"]), "validation": len(x["validation"]), "captioning": x["captioning"]})
+'
+~~~
+
+如需把 manifest 导出到当前宿主机目录，使用标准输出重定向；`-T` 可以保证文件中不会混入 TTY 控制字符：
+
+~~~bash
+dc run --rm --no-deps -T worker \
+  sh -c 'cat /data/real-input/training-input.json' > training-input.json
+test -s training-input.json && echo "exported to $PWD/training-input.json"
+~~~
+
+不要删除 heredoc 命令上的 `-T`：若生成清单时出现 `the input device is not a TTY`，说明容器仍在尝试分配 TTY；该步骤失败后 `/data/real-files.json` 不会存在，继续运行就会连带出现 `/data/real-files.json` 和 `/data/real-prepared/prepared.json` 不存在。应从生成清单的命令重新执行，而不是手工创建这两个文件。
 
 制品是 prepared.json、规范化图片与 training-input.json。最后一个文件冻结 split、checksum、处理版本、caption 来源和父 manifest；训练、恢复、评估/A-B 均引用它。用户 caption 优先，缺失项才用 template，并追加 trigger token。真实 GPU 可用 BLIP；缺模型时它明确失败，不会退回 template：
 
@@ -178,24 +211,53 @@ dc run --rm --no-deps worker lora-pipeline caption \
 
 **成功判据：** prepare 报告 accepted unique、split 和 warnings，且 /data/real-input/training-input.json 存在；DATA_PREPARATION_SECONDS 是该 prepare 调用的墙钟秒数，后续 benchmark 会原样写入汇总。不合格数据应以 DATASET_TOO_SMALL 或 DATASET_UNSUITABLE 失败。训练默认等比 resize + center crop；random_crop/horizontal_flip 必须在训练 JSON 显式启用，validation 无随机增强。
 
+规范化 PNG 使用最终编码字节的 SHA-256 内容寻址，新一次 prepare 不会覆盖旧 frozen manifest 引用的图片。升级到该实现前若训练报 `Frozen train image checksum does not match`，不要修改 manifest 或跳过校验：先重新 `dc build`，再完整重跑本模块的 `prepare_ibean_data`（包含 prepare 和 caption），最后重新开始训练。错误 details 中的 path、expected_sha256 和 actual_sha256 可用于确认损坏文件。
+
 ### 模块 2：Training
 
 **对应要求：** 配置化 LoRA、GPU memory management、checkpoint/resume、progress monitoring。
 
 sd15 是真实 Diffusers/PEFT 训练，基础权重冻结。configs/sd15-smoke.json 是 512px、batch 1、accumulation 4、rank/alpha 4、FP16、gradient checkpointing 的 10-step GPU 验证配置，不是质量或吞吐 benchmark。
 
+训练是前台命令，只需要当前一个 terminal；命令返回前 shell 看起来被占用是正常现象。第二个 terminal 仅用于可选的 `watch -n 1 nvidia-smi` 监控。模块 1–3 不要提前启动常驻 worker，模块 4 才执行 `dc up -d api worker`。
+
+SD 1.5 权重保存在 Compose 的 `model-cache` volume。首次训练前先在联网环境预热一次缓存，并把实际解析出的 immutable commit 写入本次训练配置；后续训练和恢复使用该 pinned、offline 配置，避免上游默认分支更新导致基座漂移：
+
+~~~bash
+dc run --rm --no-deps -i -T -v "$PWD/configs:/workspace/configs:ro" worker python - <<'PY'
+import json
+from pathlib import Path
+from huggingface_hub import snapshot_download
+repo = "stable-diffusion-v1-5/stable-diffusion-v1-5"
+root = Path(snapshot_download(repo_id=repo))
+revision = root.name
+if len(revision) < 7:
+    raise RuntimeError(f"snapshot did not resolve to an immutable commit: {root}")
+config = json.loads(Path("/workspace/configs/sd15-smoke.json").read_text())
+config.update({"model_name": repo, "revision": revision, "local_files_only": True})
+Path("/data/sd15-smoke-pinned.json").write_text(json.dumps(config, indent=2) + "\n")
+print(json.dumps({"snapshot": str(root), "revision": revision, "config": "/data/sd15-smoke-pinned.json"}))
+PY
+
+# 验证 pinned revision 在断网模式下也能从同一个 named volume 解析：
+dc run --rm --no-deps -T worker python -c \
+  'import json; from pathlib import Path; from huggingface_hub import snapshot_download; c=json.loads(Path("/data/sd15-smoke-pinned.json").read_text()); print(snapshot_download(repo_id=c["model_name"], revision=c["revision"], local_files_only=True))'
+~~~
+
+若这里下载失败，先修复 Docker 容器的 Hugging Face 网络、代理/DNS或磁盘空间。模型仓库需要认证时，在宿主机 `export HF_TOKEN=...`，并仅在预热命令的 `worker` 前增加 `-e HF_TOKEN`；不要把 token 写进镜像、配置或 README。完成预热后 pinned 配置只读本地缓存，训练命令无需继续传 token。`BASE_MODEL_UNAVAILABLE` 的 details 会报告已脱敏的模型名、revision、缓存目录、离线模式和底层原因。不要通过反复启动训练代替缓存预热。
+
 ~~~bash
 dc run --rm --no-deps -v "$PWD/configs:/workspace/configs:ro" worker \
   lora-pipeline train --input /data/real-input/training-input.json \
-  --config /workspace/configs/sd15-smoke.json \
+  --config /data/sd15-smoke-pinned.json \
   --output /data/sd15-smoke-training --stop-after-step 5
 dc run --rm --no-deps -v "$PWD/configs:/workspace/configs:ro" worker \
   lora-pipeline train --input /data/real-input/training-input.json \
-  --config /workspace/configs/sd15-smoke.json --output /data/sd15-smoke-training \
+  --config /data/sd15-smoke-pinned.json --output /data/sd15-smoke-training \
   --resume /data/sd15-smoke-training/checkpoints/step-00000005/checkpoint.json
 ~~~
 
-每 step 输出 global_step、loss、samples_processed、samples_processed_this_run、samples_per_second、checkpoint_seconds、cpu_rss_bytes，以及 CUDA 的 gpu_memory_allocated/reserved。CLI 输出是一串多行缩进 JSON 对象，**不是 JSONL**；不要用会吞掉失败码的 pipe 解析。training-result.json 记录 adapter checksum、配置、基座 revision/fingerprint、input hash、参数量与 elapsed_seconds。
+CLI 在 stderr 逐行显示当前阶段、文本进度条、current/total 和百分比，包括 input validation、model loading、training、checkpoint、adapter saving；不需要另开 terminal 才能看到进度。每个训练 step 的后端 progress 仍记录 global_step、loss、samples_processed、samples_processed_this_run、samples_per_second、checkpoint_seconds、cpu_rss_bytes，以及 CUDA 的 gpu_memory_allocated/reserved，供 worker/API 查询。stdout 只保留最终结果 JSON，便于脚本解析；不要用会吞掉失败码的 pipe。training-result.json 记录 adapter checksum、配置、基座 revision/fingerprint、input hash、参数量与 elapsed_seconds。
 
 **成功判据：** result 为 COMPLETED，global_step 为 10，并有 adapter/adapter.safetensors。输入/基座/数值配置不匹配为 CHECKPOINT_INCOMPATIBLE，损坏 checkpoint 为 CHECKPOINT_CORRUPT，OOM 为 GPU_OUT_OF_MEMORY；不会自动换参数重跑。
 
@@ -205,8 +267,10 @@ dc run --rm --no-deps -v "$PWD/configs:/workspace/configs:ro" worker \
 
 evaluate 先重新加载 adapter 做技术检查，再以固定 prompt、seed、steps、guidance 为 base/LoRA 生成配对输出。真实 SD 1.5 报告 CLIP prompt score、held-out similarity、diversity、max train similarity、base 对照、evaluation.html/json。项目没有 FID；这些诊断也不能单独证明风格质量。先建立与真实数据集的主体/风格匹配的 prompt 配置；下面的 portrait 文本只保证命令可运行，必须替换为该数据集的真实评估 prompts。
 
+Evaluation 同样在 stderr 显示当前阶段和进度条，包括 technical smoke、base/adapter generation、CLIP model loading、generated/held-out/train reference scoring 和 report writing；stdout 只输出最终 evaluation JSON。模型加载阶段百分比保持在 0% 并不表示卡死，应等待进入逐图 generation/scoring；若失败则以非零退出并在 stderr 返回结构化 error。
+
 ~~~bash
-dc run --rm --no-deps -i -v "$PWD/configs:/workspace/configs:ro" worker python - <<'PY'
+dc run --rm --no-deps -i -T -v "$PWD/configs:/workspace/configs:ro" worker python - <<'PY'
 import json
 from pathlib import Path
 config=json.loads(Path("/workspace/configs/evaluation-smoke.json").read_text())
@@ -219,10 +283,10 @@ dc run --rm --no-deps -v "$PWD/configs:/workspace/configs:ro" worker \
   --input /data/real-input/training-input.json --output /data/sd15-smoke-evaluation \
   --config /data/real-evaluation.json
 
-dc run --rm --no-deps -i -v "$PWD/configs:/workspace/configs:ro" worker python - <<'PY'
+dc run --rm --no-deps -i -T worker python - <<'PY'
 import json
 from pathlib import Path
-x=json.loads(Path("/workspace/configs/sd15-smoke.json").read_text())
+x=json.loads(Path("/data/sd15-smoke-pinned.json").read_text())
 x["learning_rate"]=0.0002
 Path("/data/sd15-smoke-b.json").write_text(json.dumps(x))
 PY
@@ -258,7 +322,7 @@ scripts/api_demo.py 只针对生成 PNG/tiny 回归：它硬编码 image/png，�
 
 ~~~bash
 export API_MAX_STEPS=10
-dc run --rm --no-deps -i -e API_MAX_STEPS -e LORA_DEMO_TOKEN="$DEMO_TOKEN" \
+dc run --rm --no-deps -i -T -e API_MAX_STEPS -e LORA_DEMO_TOKEN="$DEMO_TOKEN" \
   -v "$DATASET_DIR:/input:ro" api python - <<'PY'
 import hashlib,json,mimetypes,os,time,uuid
 from pathlib import Path
@@ -334,15 +398,37 @@ dc down 保留 named volumes，随后 dc up -d 可恢复服务和制品；docker
 
 若 docker compose build 在拉取 python:3.12-slim-bookworm metadata 时超时，Dockerfile 尚未开始执行。检查 Docker daemon 的出网、代理和 DNS，确认 daemon 能访问 Docker Hub 后重试。GPU_UNAVAILABLE 时重跑 preflight，检查 driver、NVIDIA Container Toolkit、overlay、LORA_GPU_UUIDS。GPU_OUT_OF_MEMORY 时降低 resolution/rank/batch 或提高 accumulation，记录新配置后重新测量。
 
-若错误出现在 `Dockerfile:11` 的 `pip install .`，并包含 `files.pythonhosted.org`、`ReadTimeoutError` 或 `pip subprocess`，说明基础镜像已经成功，失败发生在 PyPI 依赖下载。镜像已设置 180 秒 pip 超时和 5 次重试；先确认宿主机和 Docker daemon 都能访问 PyPI，然后重新构建：
+若错误出现在 Dockerfile 的 `pip install` 阶段，并包含 `files.pythonhosted.org`、`ReadTimeoutError` 或 `pip subprocess`，说明基础镜像已经成功，失败发生在 PyPI 依赖下载。镜像对 PyPI 使用独立于 `TORCH_INDEX_URL` 的 `PIP_INDEX_URL`，默认超时为 300 秒、重试 10 次，并以 BuildKit cache mount 保存已成功下载的 wheel/HTTP 缓存。因此同一个 builder 上再次执行 build 会复用已下载内容；不要在普通重试时加 `--no-cache`。BuildKit 是前提，先运行 `docker buildx version`（需 sudo 时用 `sudo docker buildx version`）确认其可用，再确认 Docker daemon 能访问 PyPI，然后用与权限匹配的命令重新构建：
 
 ```bash
+# 当前用户能访问 Docker socket：
+dc build --progress=plain
+
+# 当前用户必须通过 sudo 使用 Docker：
 sudo docker run --rm python:3.12-slim-bookworm \
   python -c 'import urllib.request; print(urllib.request.urlopen("https://pypi.org/simple/", timeout=30).status)'
-dc build --progress=plain
+sudo docker compose -f compose.yaml -f compose.gpu.yaml build --progress=plain
 ```
 
-如果这个网络检查也超时，需要修复 Docker daemon 的代理/DNS，或为 Docker build 配置可用的 PyPI 镜像；单纯重复启动 worker 不会修复下载失败。`pull access denied: local-lora-pipeline` 是同一问题的后果：镜像构建失败，所以本地没有 `local-lora-pipeline:0.1.0`，Compose 才尝试从远程仓库拉取这个本地标签。确认下面命令能看到镜像后再启动服务：
+若默认 PyPI 在当前网络不稳定，可由用户选择一个可信镜像，并只改变应用依赖下载源；CPU/GPU PyTorch wheel 仍分别使用 compose 的 `TORCH_INDEX_URL`/`TORCH_INDEX_URL_GPU`。`PIP_INDEX_URL` 是 build arg，可能出现在构建元数据中，不能包含用户名、密码或 token；需要认证的镜像应使用 BuildKit secrets，超出下面命令的范围。例如：
+
+```bash
+# Replace the URL only with a mirror approved for this environment.
+export PIP_INDEX_URL='https://your-approved-pypi-mirror/simple'
+dc build --progress=plain
+
+# sudo does not inherit the exported variable reliably, so pass it to root explicitly.
+sudo env PIP_INDEX_URL='https://your-approved-pypi-mirror/simple' \
+  docker compose -f compose.yaml -f compose.gpu.yaml build --progress=plain
+```
+
+如需调大等待时间，也可在上述任一命令前设置 `PIP_DEFAULT_TIMEOUT=600 PIP_RETRIES=15`；sudo 方式同样使用 `sudo env PIP_DEFAULT_TIMEOUT=600 PIP_RETRIES=15 ...`。只有确认缓存内容需要丢弃时才重置 BuildKit 的 cache mount；这会清除该 Docker builder 中所有项目的执行缓存，下一次构建将重新下载：
+
+```bash
+sudo docker builder prune --filter type=exec.cachemount --force
+```
+
+如果 PyPI 网络检查也超时，需要修复 Docker daemon 的代理/DNS，或改用获准的镜像；单纯重复启动 worker 不会修复下载失败。`pull access denied: local-lora-pipeline` 是同一问题的后果：镜像构建失败，所以本地没有 `local-lora-pipeline:0.1.0`，Compose 才尝试从远程仓库拉取这个本地标签。确认下面命令能看到镜像后再启动服务：
 
 ```bash
 sudo docker image inspect local-lora-pipeline:0.1.0 >/dev/null
@@ -368,7 +454,7 @@ dc up -d api worker
 export BENCH_COMMIT="$(git rev-parse HEAD)"
 export BENCH_ROOT="/data/benchmarks-$(date -u +%Y%m%dT%H%M%SZ)"
 dc stop worker
-dc run --rm --no-deps -i -e BENCH_COMMIT -e BENCH_ROOT -e DATA_PREPARATION_SECONDS -v "$PWD/configs:/workspace/configs:ro" worker python - <<'PY'
+dc run --rm --no-deps -i -T -e BENCH_COMMIT -e BENCH_ROOT -e DATA_PREPARATION_SECONDS -v "$PWD/configs:/workspace/configs:ro" worker python - <<'PY'
 import csv,json,os,statistics,time
 from pathlib import Path
 from lora_pipeline.cli import _device,preflight
