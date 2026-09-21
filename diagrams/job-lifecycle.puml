@@ -2,59 +2,43 @@
 !pragma layout smetana
 skinparam backgroundColor #FFFFFF
 skinparam defaultFontName DejaVu Sans
-skinparam defaultFontSize 13
 skinparam shadowing false
-skinparam ArrowColor #475569
-skinparam stateBackgroundColor #DBEAFE
-skinparam stateBorderColor #64748B
-skinparam stateFontColor #0F172A
-skinparam noteBackgroundColor #FFFBEB
-skinparam noteBorderColor #D4AF37
-skinparam titleFontSize 23
 skinparam nodesep 45
-skinparam ranksep 40
+skinparam ranksep 45
+skinparam stateBackgroundColor #DBEAFE
 hide empty description
-title Job Lifecycle and Quality Gate\n<size:14>Workflow stages; job state and stage-task state are tracked separately</size>
-
-state "ACCEPTED\nCompleted upload + enabled profile\nAtomic job and first task creation" as Accepted
-state "PREPARE / CPU\nInspect, deduplicate, check 100-1,000 valid images\nFreeze grouped training / held-out split" as Prepare
-state "CAPTION / GPU / optional\nGenerate content-focused descriptions\nFreeze versioned training manifest" as Caption #F3E8FF
-state "TRAIN / GPU / candidate 0\nWait for compatible shared slot\nTrain adapter and checkpoint" as Train #F3E8FF
-state "EVALUATE / GPU / candidate 0\nFixed prompts, seeds and held-out references\nReload exact saved adapter + inference smoke test" as Eval #F3E8FF
-state "TRAIN + EVALUATE / GPU / candidate 1\nOne prevalidated quality remediation\nSame evaluation policy and thresholds\nEach stage reacquires a shared GPU slot" as Retry #F3E8FF
-state "PUBLISH / CPU\nVerify artifact and evaluation checksums\nGuard current attempt and cancellation\nAtomic model READY + job READY" as Publish #DCFCE7
-state "READY\nAdapter + base revision + loading manifest\nEvaluation report and authorized download" as Ready #DCFCE7
-state "FAILED\nActionable technical / data error" as Failed #FEE2E2
-state "QUALITY_REJECTED\nFailed dimensions in report\nNo published model" as Rejected #FEE2E2
+title Minimal Job Lifecycle\nJob state and stage-task state are separate
+state "ACCEPTED\nCompleted dataset + frozen config\nAtomic job and PREPARE task" as Accepted
+state "PREPARE / CPU\nValidate / exact dedup / near-duplicate groups\nFreeze approximately 90/10 split" as Prepare
+state "CAPTION / optional\nProvided text > template or BLIP\nFreeze final training-input manifest" as Caption
+state "TRAIN\nLoRA parameters only\nFull resumable checkpoints" as Train #F3E8FF
+state "EVALUATE\nReload saved adapter and generate\nCLIP diagnostics + paired A/B" as Evaluate #F3E8FF
+state "PUBLISH / CPU\nCheck exact input, adapter and report hashes\nAtomic registry + terminal job state" as Publish #DCFCE7
+state "READY\nCalibrated policy passed\nOwner-authorized download" as Ready #DCFCE7
+state "COMPLETED_UNVERIFIED\nModel: UNVERIFIED\nExplicit allow_unverified download" as Unverified #FEF3C7
+state "QUALITY_REJECTED\nCalibrated policy failed\nReport retained; no automatic retraining" as Rejected #FEE2E2
+state "FAILED\nData / configuration / OOM / technical error" as Failed #FEE2E2
 
 [*] --> Accepted
 Accepted --> Prepare
-Prepare --> Caption : Valid data; captions needed
-Prepare --> Train : Valid data; captions present
-Prepare -right-> Failed : Invalid / unsuitable data
+Prepare --> Caption : Missing captions
+Prepare --> Train : Captions already complete\nFinalize input manifest
+Prepare --> Failed : Too small / unsuitable / invalid
 Caption --> Train
-Train --> Eval : Saved candidate
-Eval --> Publish : All dimensions + smoke pass
-Eval -right-> Retry : Remediable metric failure\nBudget permits candidate 1
-Eval --> Rejected : Metric failure; no remediation
-Retry --> Publish : All dimensions + smoke pass
-Retry --> Rejected : Metric failure again
-Publish --> Ready
+Train --> Evaluate : Complete saved adapter
+Evaluate --> Publish : Technical pass; policy PASS or uncalibrated
+Evaluate --> Rejected : Calibrated policy FAIL
+Evaluate --> Failed : Load / generation / metric execution failure
+Publish --> Ready : Calibrated PASS; not test-only
+Publish --> Unverified : Uncalibrated or test-only
 Ready --> [*]
-
-note left of Train
-All GPU stages share the same 2-4 slots.
-No device is dedicated to evaluation.
-GPU waiting is a PENDING stage task,
-not additional active GPU execution.
-end note
+Unverified --> [*]
 
 legend bottom left
-  Common to every stage:
-  * Infrastructure retry: max 3 attempts per task, within cumulative GPU budget.
-  * Technical / exhausted-budget errors -> FAILED, never a quality pass.
-  * CANCEL_REQUESTED -> CANCELLED only after executor termination is confirmed.
-  * Old fencing tokens cannot commit progress or publish a model.
-  A screen may reject early; only the full calibrated policy can pass a candidate.
+  GPU stages reacquire a shared physical device; no permanent evaluation GPU.
+  Infrastructure failures: at most three attempts; restore compatible complete checkpoint.
+  OOM and quality failure do not silently alter training parameters.
+  CANCEL_REQUESTED becomes CANCELLED only after executor termination is confirmed.
+  Stale attempts cannot commit outputs or publish; test-only artifacts cannot become READY.
 endlegend
 @enduml

@@ -2,67 +2,45 @@
 !pragma layout smetana
 skinparam backgroundColor #FFFFFF
 skinparam defaultFontName DejaVu Sans
-skinparam defaultFontSize 14
 skinparam shadowing false
-skinparam roundcorner 14
 skinparam componentStyle rectangle
+skinparam nodesep 45
+skinparam ranksep 55
 skinparam ArrowColor #475569
-skinparam ArrowThickness 1.3
-skinparam nodesep 55
-skinparam ranksep 60
-skinparam noteBackgroundColor #FFFBEB
-skinparam noteBorderColor #D4AF37
-skinparam titleFontSize 25
-skinparam titleFontColor #0F172A
-skinparam footerFontColor #64748B
 top to bottom direction
-title Automatic LoRA Training Pipeline\n<size:15>Style customization | 100-1,000 images | shared pool of 2-4 GPUs</size>
+title Minimal LoRA Training Pipeline\nSingle host | SD 1.5 | 100-1,000 images | explicit CPU test backend
+actor "User / local GPU tester" as User
+component "FastAPI + API keys\nTenant ownership / bounded uploads\nIdempotent jobs / status / cancellation" as API #DBEAFE
+database "SQLite\nMetadata + durable stage queue\nAttempts / progress / registry" as DB #DBEAFE
+component "Single worker supervisor\nSingleton OS lock\nFair dispatch / watchdog / recovery" as Supervisor #DBEAFE
+component "CPU stage subprocesses\nVERIFY / PREPARE / template CAPTION\nPUBLISH" as CPU #E2E8F0
+node "Physical GPU slots on one host\nDefault: one RTX 4060 Ti 16GB\nOptional BLIP | TRAIN | EVALUATE\nOne stage per physical GPU UUID\nProcess-group identity + device OS lock" as GPU #F3E8FF
+storage "Local persistent volume\nImmutable upload objects and manifests\nCheckpoints / adapters / images / reports\nAtomic writes + SHA-256" as Files #E0F2FE
+component "Model registry\nUNVERIFIED: explicit opt-in download\nREADY: calibrated policy + load test passed" as Registry #DCFCE7
+component "Inference / A-B report\nCompatible SD 1.5 base + adapter\nPaired prompts, seeds and settings" as Consumer #DCFCE7
+component "Logs + health + metrics\nQueue / steps / memory / retries\nBenchmark definitions, no invented results" as Metrics #FEF3C7
 
-actor "User / client" as User #E2E8F0
-component "API + authentication\nUpload sessions and job admission\nStatus, cancellation, model access" as API #DBEAFE
-database "PostgreSQL\nMetadata + durable stage queue\nLeases, budgets, registry records" as DB #DBEAFE
-component "Scheduler + reconciler\nActive instance + standby\nFair dispatch, guarded claims, retries" as Scheduler #DBEAFE
-component "CPU workers\nPREPARE: inspect, deduplicate, split\nPUBLISH: verify and register" as CPU #E2E8F0
-node "GPU host agents / isolated containers\n\nONE SHARED POOL: 2-4 DEVICE SLOTS\nCAPTION (optional) | TRAIN | EVALUATE\nEvaluation includes inference-load smoke test\n\nOne stage per GPU; one current attempt per job\nExclusive device locks + lease watchdogs" as GPU #F3E8FF
-storage "S3-compatible object storage\nTenant-scoped images and manifests\nCheckpoints, adapters, reports\nImmutable versions + checksums" as Objects #E0F2FE
-component "Logical model registry\nREADY versions only\nAdapter + base revision + loading manifest" as Registry #DCFCE7
-component "Existing inference consumer\nLoad compatible approved adapter\nOnline serving fleet is outside scope" as Inference #F1F5F9
-component "Observability\nQueue age / GPU use / lease loss\nQuality / budgets / audit trail" as Observe #FEF3C7
-
-' Ranking follows the control flow; feedback edges do not determine ranks.
-User -down-> API : 1  Request upload URLs\nSubmit / poll / cancel
-API -right-> DB : 2  Atomic job + task creation\nIdempotency / status reads
-API -[hidden]down-> Scheduler
-Scheduler -[#64748B,dashed,norank]-> DB : 3  Poll / claim tasks\nLeases + budget reservations
-Scheduler -down-> CPU : Dispatch CPU stages
-Scheduler -down-> GPU : 4  GPU stage dispatch\nToken + lease + deadline
-CPU -[hidden]right-> GPU
-GPU -[#0284C7,dashed]right-> Objects : 5  Read pinned inputs\nWrite checkpoint / adapter / report
-CPU -down-> Registry : 6  Full PASS + smoke evidence\nVerify artifacts and publish
-GPU -[hidden]down-> Registry
-Registry -down-> Inference : 7  Authorized versioned handoff
-Objects -[hidden]down-> Observe
-
-User -[#0284C7,dashed,norank]-> Objects : Direct upload\nScoped, expiring URLs
-CPU -[#0284C7,dashed,norank]-> Objects : Images / prepared manifests
-CPU -[#64748B,dashed,norank]-> DB : CPU heartbeat + fenced completion\nBind manifest and enqueue successor
-GPU -[#64748B,dashed,norank]-> DB : GPU heartbeat + fenced completion\nAtomically enqueue next stage
-Registry -[#64748B,dashed,norank]-> DB : Model READY + job READY\nOne guarded transaction
-Registry -[#0284C7,dashed,norank]-> Objects : Checksummed artifact references
-API -[#64748B,dashed,norank]-> Registry : Authorized lookup
-Scheduler -[#D97706,dotted,norank]-> Observe : Controller metrics
-GPU -[#D97706,dotted,norank]-> Observe : Worker metrics / logs
+User --> API : 1  Upload manifest and bytes\nSubmit / poll / cancel
+API --> DB : 2  Atomic admission\nand task creation
+API -right-> Files : Stream bounded uploads\nFreeze exact objects
+Supervisor --> DB : Claim / heartbeat / guarded completion
+Supervisor --> CPU : 3  CPU dispatch
+Supervisor --> GPU : 4  Shared GPU dispatch
+CPU --> Files : Clean / group / split / caption
+GPU --> Files : 5  Train / checkpoint / generate\nEvaluate exact saved adapter
+CPU --> Registry : 6  Register verified references
+Registry --> DB : Unique model per job\nGuard cancellation and attempt
+Registry --> Consumer : 7  Authorized artifact handoff
+Registry --> Files : Checksummed manifest references
+API --> Registry : Owner-scoped lookup
+Supervisor ..> Metrics
+GPU ..> Metrics
 
 legend bottom left
-  |= Color |= Responsibility |
-  | Blue | Control plane and durable state |
-  | Purple | All GPU stages share one finite pool |
-  | Green | Quality-gated delivery boundary |
-  | Blue dashed links | Direct artifact transfer |
-  | Gray links | Control / metadata (key paths shown) |
-  Logical components may share a process; registry is backed by PostgreSQL + object storage.
-  GPU class cycle: EVALUATE, TRAIN, CAPTION, TRAIN; fair user rotation within each class.
-  Lost leases fence results; unconfirmed devices quarantine until termination is confirmed.
+  API and supervisor are separate processes; all persistent volumes are host-local.
+  GPU cycle: EVALUATE, TRAIN, CAPTION, TRAIN; owner round-robin within each class.
+  CPU fake slots are test-only and never map multiple slots to one real GPU.
+  No calibrated policy: COMPLETED_UNVERIFIED, never an implied quality guarantee.
+  Multi-host failover and automatic quality remediation are deferred; see trade-offs.
 endlegend
-footer DESIGN PROPOSAL | Model / hardware neutral | No measured throughput or quality claims
 @enduml

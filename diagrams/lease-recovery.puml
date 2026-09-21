@@ -1,62 +1,43 @@
 @startuml lease-recovery
 skinparam backgroundColor #FFFFFF
 skinparam defaultFontName DejaVu Sans
-skinparam defaultFontSize 13
 skinparam shadowing false
-skinparam sequenceArrowColor #475569
-skinparam sequenceLifeLineBorderColor #94A3B8
-skinparam sequenceParticipantBorderColor #64748B
 skinparam sequenceParticipantBackgroundColor #DBEAFE
-skinparam sequenceGroupBackgroundColor #F8FAFC
-skinparam noteBackgroundColor #FEF3C7
-skinparam noteBorderColor #D4AF37
-skinparam titleFontSize 23
-title Lease Recovery Without Stale Publication
+title Single-Host Recovery and Stale-Result Rejection
 autonumber
+participant "Supervisor" as S
+database "SQLite" as DB
+participant "Stage process group\nattempt 1 + watchdog" as Old #F3E8FF
+collections "Local artifacts +\nGPU UUID OS lock" as Files
+participant "Replacement stage\nattempt 2" as New #F3E8FF
 
-participant "Scheduler /\nreconciler" as S
-database "PostgreSQL\nauthoritative state" as DB
-participant "Host A / GPU A\nattempt a1" as A #F3E8FF
-collections "Immutable\nobject storage" as O #E0F2FE
-participant "Host B / GPU B\nattempt a2" as B #F3E8FF
-
-S -> DB : Short transaction: claim task + GPU A\nPersist token 41, lease expiry and budget reservation
-S -> A : Start with token 41 and hard deadline
-A -> DB : Renew token 41 lease every 10 s
-A -> O : Write checkpoint data, then complete manifest
-note over A,DB
-Lease duration: 60 s (design default).
-Host watchdog stops before its safe lease deadline
-if renewal cannot be confirmed.
+S -> DB : Claim task; persist token and deadline
+S -> Old : Spawn isolated process session
+Old -> Files : Acquire exclusive physical-device lock
+Old -> DB : Record PID, start time and process group\nHeartbeat with current attempt token
+Old -> Files : Atomic complete checkpoint + checksum manifest
+S -> S : Supervisor interruption / restart
+S -> DB : Recover durable task and attempt state
+note over S,Old
+New supervisor holds the singleton lock.
+Old stage may still be running; a missed heartbeat
+alone is not evidence that the GPU is free.
 end note
-
-group Network partition / missed heartbeat
-  A -x DB : Renewal cannot be confirmed
-  S -> DB : After lease expiry, revoke token 41\nMark attempt lost; QUARANTINE GPU A
-  note over S,A
-Never treat lease expiry as proof that the GPU is idle.
-GPU A stays unavailable until termination and health are confirmed.
-  end note
-end
-
-S -> DB : If retry count + conservative budget permit:\nclaim healthy GPU B; issue token 42
-S -> B : Retry same stage with token 42\nReference latest compatible complete checkpoint
-B -> O : Verify manifest / hashes; restore training state
-B -> DB : Renew token 42; persist progress
-
-group Old host reconnects
-  A -> DB : Late progress / completion with token 41
-  DB --> A : Reject stale token; no canonical state change
-  S -> A : Confirm process stopped and device healthy
-  A --> S : Termination + health acknowledgement
-  S -> DB : Release GPU A quarantine only after confirmation
-end
-
-B -> O : Write immutable attempt artifacts + complete manifest
-B -> DB : Guard token 42 + lease + job state\nComplete task and enqueue next stage atomically
-note over S,B
-After EVALUATE passes, CPU PUBLISH checks the exact artifact/report.
-Model READY + job READY commit together; uniqueness prevents duplicates.
-At-least-once execution, fenced and effectively-once publication.
+S -> Old : Verify PID + start time + attempt identity\nRequest stop of exact process group
+Old -> Old : Watchdog also stops on controller loss / deadline
+Old --> S : Process group exits
+S -> Files : Confirm exclusive device lock is available
+S -> DB : Fence old attempt; schedule bounded retry
+S -> New : Spawn with new token and compatible checkpoint
+New -> Files : Acquire device lock; verify checkpoint hashes
+New -> New : Restore LoRA + optimizer + scheduler + scaler\nRNG + sample position + augmentation state
+Old -> DB : Any late completion using old token
+DB --> Old : Reject stale or terminal attempt
+New -> Files : Write adapter / evaluation / complete manifests
+New -> DB : Guard token, live lease and job state\nComplete stage and enqueue successor atomically
+note over S,New
+Cancel waits for confirmed termination before CANCELLED.
+Publication checks exact artifact/report hashes and job uniqueness.
+Uncalibrated results register only as UNVERIFIED.
 end note
 @enduml

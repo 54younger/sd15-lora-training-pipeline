@@ -1,73 +1,102 @@
-# Automatic LoRA Training Pipeline — Assignment Submission
+# Automatic LoRA Training Pipeline
 
-本目录交付 **Part 1: System Design** 要求的两项成果。正式文档和图中标注使用英文；本文提供中文阅读导航。方案面向风格 LoRA：输入 100–1,000 张图片，2–4 张 GPU 处理并发任务，模型通过质量门槛后交付给推理消费者。基础模型与 GPU 型号通过训练配置抽象，不固定某一厂商或型号。
+单机 LoRA 训练流水线作业：FastAPI + SQLite + 本地制品存储 + 独立 worker。支持真实 SD 1.5 LoRA、离线 CPU 小模型测试、可选 BLIP caption、CLIP 诊断与配对 A/B 报告。
 
-## 两个交付物
+## 交付入口
 
-| 交付物 | 内容 | 文件 |
+| 内容 | 中文 | English |
 |---|---|---|
-| 1. System Architecture Diagram | 从上传到模型交付的数据流、组件交互、共享 GPU 池、扩展与故障恢复；含总体架构图及两张辅助图 | [架构文档](docs/01-system-architecture.md) |
-| 2. Technical Specification | 组件职责、调度、训练和质量策略、API 契约、数据模型、错误处理、安全与运维、验收场景 | [技术规格](docs/02-technical-specification.md) |
+| Part 1 架构与图 | [系统架构](docs/01-system-architecture.md) | [Architecture](docs_en/01-system-architecture.md) |
+| 组件、状态与 API 契约 | [技术规格](docs/02-technical-specification.md) | [Specification](docs_en/02-technical-specification.md) |
+| 单机实现取舍 | [取舍记录](docs/03-implementation-tradeoffs.md) | [Decision record](docs_en/03-implementation-tradeoffs.md) |
+| 安装、API、CPU/GPU 验证 | [运行指南](docs/04-running-and-api.md) | [Run guide](docs_en/04-running-and-api.md) |
+| 性能指标与采集协议 | [性能指标](docs/05-performance-benchmarks.md) | [Performance definitions](docs_en/05-performance-benchmarks.md) |
 
-这是架构与技术设计交付。文中的时限、配额与策略默认值是设计选择；硬件性能需要按训练配置实测，质量阈值需要离线校准。未实现训练服务，也未宣称完成真实模型训练或部署。
+![Architecture](diagrams/system-architecture.png)
 
-## 图表预览与 PlantUML 代码
+三张图均提供 [PlantUML 源码](diagrams/system-architecture.puml)、PNG 和 SVG；生命周期与恢复图位于同一 `diagrams` 目录。现有 Part 1 已调整为本次实际选择的单机架构。
 
-![System architecture](diagrams/system-architecture.png)
+## 快速开始：CPU 离线验证
 
-| 图表 | 可编辑源代码 | 矢量图（适合放大与文档排版） | 图片 |
-|---|---|---|---|
-| 总体架构、组件与数据流 | [system-architecture.puml](diagrams/system-architecture.puml) | [SVG](diagrams/system-architecture.svg) | [PNG](diagrams/system-architecture.png) |
-| 任务阶段、质量门槛与有限重训 | [job-lifecycle.puml](diagrams/job-lifecycle.puml) | [SVG](diagrams/job-lifecycle.svg) | [PNG](diagrams/job-lifecycle.png) |
-| 租约失效、设备隔离与旧结果拦截 | [lease-recovery.puml](diagrams/lease-recovery.puml) | [SVG](diagrams/lease-recovery.svg) | [PNG](diagrams/lease-recovery.png) |
-
-`.puml` 文件包含完整的 PlantUML 代码，SVG/PNG 是从这些源文件实际渲染得到的。使用纯本地渲染；图表源码不需要提交到公共在线渲染服务。
-
-## 与 Evaluation Criteria 的对应关系
-
-| 评分维度 | 本方案的主要证据 |
-|---|---|
-| Understanding of ML pipeline architecture | 数据版本、分组去重与验证集隔离、内容标注、LoRA 训练、完整检查点、多维质量评估、保存后重新加载验证 |
-| Knowledge of distributed systems | 事务性入队、任务租约与 fencing token、幂等 API、设备隔离、失败恢复、取消与发布竞争、单次生效的发布 |
-| Consideration of production requirements | 多租户权限、上传限制、可追溯数据模型、任务配额、错误码、监控审计、备份和保留策略 |
-| Creative problem-solving for resource constraints | 训练与评估共享 GPU、按用户公平且利用空闲容量的调度、有限重训、兼容缓存、提前拒绝无效数据、统一 GPU 时间预算 |
-
-架构文档第 6 节提供英文评分映射；技术规格最后一节给出可验证场景。
-
-## 复现渲染
-
-环境：Bash、Java 21、`sha256sum`，以及固定版本的 PlantUML 1.2026.8 JAR。架构与流程图使用内置 Smetana 布局，无需安装 Graphviz；恢复图使用 PlantUML 的时序图布局。参见 [PlantUML Smetana 文档](https://plantuml.com/smetana02)及[命令行文档](https://plantuml.com/command-line)。
-
-先从 Maven Central 下载官方发布的渲染器到临时目录：
+要求 Linux/WSL2、Python 3.12。先安装依赖；测试和 CPU smoke 运行时不下载预训练模型。
 
 ```bash
-curl --fail --location \
-  https://repo.maven.apache.org/maven2/net/sourceforge/plantuml/plantuml/1.2026.8/plantuml-1.2026.8.jar \
-  --output /tmp/creaition-plantuml-1.2026.8.jar
+python3.12 -m venv .venv
+source .venv/bin/activate
+python -m pip install torch==2.8.0 torchvision==0.23.0 --index-url https://download.pytorch.org/whl/cpu
+python -m pip install -e '.[dev]'
+HF_HUB_OFFLINE=1 python -m pytest -q
+HF_HUB_OFFLINE=1 lora-pipeline cpu-smoke --output /tmp/lora-cpu-smoke
 ```
 
-在项目根目录运行：
+输出目录必须是新目录或空目录。CPU smoke 生成 120 张图片，清洗与划分，运行小型 LoRA 训练、中断恢复、加载和评估流程。小模型是测试后端，不能证明真实风格质量。
+
+## 运行 API 与 worker
+
+两个终端使用相同配置与数据目录。以下 token 仅用于本机演示，公开部署前替换。
+
+```bash
+export LORA_API_KEYS='{"local-demo-token":"alice"}'
+export LORA_ADMIN_KEYS='["local-demo-token"]'
+export LORA_TEST_BACKEND=1
+export LORA_FAKE_SLOTS=1
+export LORA_DATA_DIR="$PWD/var"
+lora-pipeline api
+```
+
+第二个终端设置同样的环境变量后：
+
+```bash
+lora-pipeline worker
+```
+
+浏览 `http://127.0.0.1:8000/docs` 查看 OpenAPI。实际 HTTP 端到端演示：
+
+```bash
+lora-pipeline generate-data --output /tmp/lora-demo-images
+LORA_DEMO_TOKEN=local-demo-token python scripts/api_demo.py \
+  --files /tmp/lora-demo-images/files.json --output /tmp/lora-demo-result
+```
+
+默认质量策略未校准，因此成功任务进入 `COMPLETED_UNVERIFIED`，模型为 `UNVERIFIED`；下载必须显式使用 `allow_unverified=true`。只有具备校准依据并通过质量门禁的真实模型才能进入 `READY`。
+
+## RTX 4060 Ti 16GB 本地验证
+
+在具备可用 NVIDIA 驱动的 Linux/WSL2 环境安装 CUDA 版 PyTorch；首次运行需要下载模型，也可以提前缓存后使用 `--local-files-only`。
+
+```bash
+python -m pip install torch==2.8.0 torchvision==0.23.0 --index-url https://download.pytorch.org/whl/cu128
+lora-pipeline preflight
+lora-pipeline gpu-smoke --output /tmp/lora-gpu-smoke
+```
+
+此命令执行真实 SD 1.5 LoRA：第 5 步保存并中断，恢复至第 10 步，加载 adapter 并生成小规模 A/B 图像与 CLIP 指标。它验证技术链路，不代表训练出了合格风格。基础模型、caption 模型和 CLIP 缓存的准备方式见运行指南。
+
+## Docker
+
+按 `.env.example` 设置 `.env` 后：
+
+```bash
+docker compose build
+docker compose up
+```
+
+真实 GPU 模式需 NVIDIA Container Toolkit 与可用驱动：
+
+```bash
+docker compose -f compose.yaml -f compose.gpu.yaml build
+docker compose -f compose.yaml -f compose.gpu.yaml up
+```
+
+API 与 worker 共享本地主机卷，不能通过网络共享 SQLite 文件扩展为多机平台。直接 CLI GPU 运行与 worker 若使用同一设备，应共享 `LORA_DATA_DIR`，从而使用同一设备锁。
+
+## 图表渲染与开发检查
 
 ```bash
 JAVA_BIN=/usr/lib/jvm/java-21-openjdk-amd64/bin/java \
   bash scripts/render-diagrams.sh /tmp/creaition-plantuml-1.2026.8.jar
+python -m ruff check src tests scripts/api_demo.py
+python -m mypy
 ```
 
-如果 `java` 已指向 Java 21，可省略 `JAVA_BIN`；其他系统按实际 Java 路径设置。脚本先校验渲染器 SHA-256 和全部图表语法，再生成三组 SVG/PNG。脚本只会更新本目录内的六个渲染图片文件。
-
-固定渲染器 SHA-256：
-
-```text
-0f77e5f769836b3dee340e207fe497c3e4c43e973d559e3c306915da9c32e34c
-```
-
-需要了解各项设计取舍时，从架构文档顺序阅读；需要核对接口、状态和字段时，直接阅读技术规格。引用的官方文档和研究资料放在相关论述附近，便于逐项验证。
-
-## 交付检查
-
-- 独立设计评审已完成，发现的接口、并发、数据版本与故障恢复问题已修正并复核。
-- 三份 PlantUML 源码通过语法检查，已实际生成三张 SVG 和三张 PNG，并检查渲染结果。
-- 六段 JSON 示例通过解析，示例 UUID/SHA-256 格式有效；文档中的 23 个本地链接均可解析。
-- SVG 通过 XML 解析，渲染脚本通过 Bash 语法检查并实际执行成功。
-
-这些是设计文档与交付资产的检查；技术规格中的验收场景是将来实现系统时的验证要求，不表示已运行真实训练或故障注入测试。
+渲染脚本验证固定 PlantUML JAR checksum，使用内置 Smetana 布局，无需 Graphviz。性能交付是指标定义和采集方法；未执行的 GPU 测量保持 `not_measured`。[验证记录](VALIDATION.md) 分别列出 CPU 测试、图表、容器及用户本地 GPU 的执行状态。
