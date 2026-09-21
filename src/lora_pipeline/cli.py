@@ -19,6 +19,33 @@ def _print(value):
     print(json.dumps(value, indent=2, default=str, allow_nan=False), flush=True)
 
 
+def _progress_to_stderr(event: object) -> None:
+    """Render an optional backend event for humans without polluting JSON stdout."""
+    try:
+        payload = event if isinstance(event, dict) else {}
+        phase = str(payload.get("phase") or "working").replace("_", " ")
+        current = payload.get("current", payload.get("global_step", payload.get("generated_images", 0)))
+        total = payload.get("total", payload.get("generation_total", 0))
+        current_number = max(0, int(current))
+        total_number = int(total)
+        if total_number > 0:
+            current_number = min(current_number, total_number)
+            percent = 100 * current_number / total_number
+            filled = round(20 * current_number / total_number)
+            bar = "#" * filled + "-" * (20 - filled)
+            line = f"[{phase}] [{bar}] {current_number}/{total_number} {percent:5.1f}%"
+        else:
+            line = f"[{phase}] [{'?' * 20}] {current_number}/?   n/a"
+    except Exception:
+        # Progress rendering is observational: malformed or old events must
+        # never turn a successful operation into a CLI failure.
+        line = "[progress] [????????????????????] 0/?   n/a"
+    try:
+        print(line, file=sys.stderr, flush=True)
+    except Exception:
+        pass
+
+
 @contextlib.contextmanager
 def _device(device: str, selected_uuid: str | None = None):
     if not device.startswith("cuda"):
@@ -89,9 +116,9 @@ def _smoke(args):
             local_files_only=getattr(args, "local_files_only", False),
         )
         half = config.max_steps // 2
-        first = train(inputs, out / "training", config, progress=_print, stop_after_step=half)
+        first = train(inputs, out / "training", config, progress=_progress_to_stderr, stop_after_step=half)
         resumed = train(
-            inputs, out / "training", config, progress=_print, resume_from=Path(first["checkpoint_path"])
+            inputs, out / "training", config, progress=_progress_to_stderr, resume_from=Path(first["checkpoint_path"])
         )
         if resumed["global_step"] != config.max_steps:
             raise PipelineError("SMOKE_FAILED", "Resumed training did not reach expected optimizer step")
@@ -108,7 +135,7 @@ def _smoke(args):
                 device=device,
                 local_files_only=config.local_files_only,
             ),
-            progress=_print,
+            progress=_progress_to_stderr,
         )
         if not evaluation["technical_pass"]:
             raise PipelineError("SMOKE_FAILED", "Saved adapter failed inference smoke test")
@@ -237,7 +264,7 @@ def main(argv: list[str] | None = None) -> int:
                         load_manifest(args.input),
                         args.output,
                         config,
-                        progress=_print,
+                        progress=_progress_to_stderr,
                         resume_from=args.resume,
                         stop_after_step=args.stop_after_step,
                     )
@@ -250,7 +277,7 @@ def main(argv: list[str] | None = None) -> int:
                 inputs = load_manifest(args.input)
                 if args.command == "evaluate":
                     result = evaluate(
-                        load_manifest(args.training_result), inputs, args.output, config, progress=_print
+                        load_manifest(args.training_result), inputs, args.output, config, progress=_progress_to_stderr
                     )
                 else:
                     result = compare_adapters(
@@ -259,7 +286,7 @@ def main(argv: list[str] | None = None) -> int:
                         inputs,
                         args.output,
                         config,
-                        progress=_print,
+                        progress=_progress_to_stderr,
                     )
                 _print(result)
         else:

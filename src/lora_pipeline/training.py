@@ -14,6 +14,7 @@ import importlib.metadata
 import json
 import os
 import random
+import re
 import shutil
 import tempfile
 import time
@@ -132,6 +133,26 @@ def _manifest_digest(manifest: dict) -> str:
     )
 
 
+def _checksum_error(
+    message: str,
+    *,
+    path: Path,
+    expected_sha256: str | None,
+    actual_sha256: str | None,
+    read_error: OSError | None = None,
+    **details,
+) -> PipelineError:
+    error_details = {
+        **details,
+        "path": str(path),
+        "expected_sha256": expected_sha256,
+        "actual_sha256": actual_sha256,
+    }
+    if read_error is not None:
+        error_details["read_error"] = f"{type(read_error).__name__}: {read_error}"
+    return PipelineError("CHECKSUM_MISMATCH", message, details=error_details)
+
+
 def validate_input_integrity(input_manifest: dict) -> None:
     """Bind work to a frozen manifest and to the bytes of every source image."""
     expected_manifest = input_manifest.get("manifest_sha256") or input_manifest.get(
@@ -140,8 +161,23 @@ def validate_input_integrity(input_manifest: dict) -> None:
     manifest_path = input_manifest.get("manifest_path")
     if manifest_path:
         path = Path(manifest_path)
-        if not path.is_file() or (expected_manifest and sha256_file(path) != expected_manifest):
-            raise PipelineError("CHECKSUM_MISMATCH", "Frozen input manifest checksum does not match")
+        try:
+            actual_manifest = sha256_file(path)
+        except OSError as exc:
+            raise _checksum_error(
+                "Frozen input manifest checksum does not match",
+                path=path,
+                expected_sha256=expected_manifest,
+                actual_sha256=None,
+                read_error=exc,
+            ) from exc
+        if expected_manifest and actual_manifest != expected_manifest:
+            raise _checksum_error(
+                "Frozen input manifest checksum does not match",
+                path=path,
+                expected_sha256=expected_manifest,
+                actual_sha256=actual_manifest,
+            )
         try:
             on_disk = json.loads(path.read_text())
             in_memory = {
@@ -153,8 +189,20 @@ def validate_input_integrity(input_manifest: dict) -> None:
                 raise PipelineError("CHECKSUM_MISMATCH", "In-memory manifest differs from its frozen file")
         except PipelineError:
             raise
+        except OSError as exc:
+            raise _checksum_error(
+                "Frozen input manifest cannot be read",
+                path=path,
+                expected_sha256=expected_manifest,
+                actual_sha256=actual_manifest,
+                read_error=exc,
+            ) from exc
         except Exception as exc:
-            raise PipelineError("CHECKSUM_MISMATCH", "Frozen input manifest cannot be parsed") from exc
+            raise PipelineError(
+                "CHECKSUM_MISMATCH",
+                "Frozen input manifest cannot be parsed",
+                details={"path": str(path), "read_error": f"{type(exc).__name__}: {exc}"},
+            ) from exc
     elif expected_manifest:
         body = {
             key: value
@@ -166,11 +214,26 @@ def validate_input_integrity(input_manifest: dict) -> None:
     for split in ("train", "validation"):
         for entry in _entries(input_manifest, split):
             expected, path = entry.get("sha256"), Path(entry["path"])
-            if not expected or not path.is_file() or sha256_file(path) != expected:
-                raise PipelineError(
-                    "CHECKSUM_MISMATCH",
+            try:
+                actual = sha256_file(path)
+            except OSError as exc:
+                raise _checksum_error(
                     f"Frozen {split} image checksum does not match",
-                    details={"id": entry.get("id")},
+                    path=path,
+                    expected_sha256=expected,
+                    actual_sha256=None,
+                    read_error=exc,
+                    id=entry.get("id"),
+                    split=split,
+                ) from exc
+            if not expected or actual != expected:
+                raise _checksum_error(
+                    f"Frozen {split} image checksum does not match",
+                    path=path,
+                    expected_sha256=expected,
+                    actual_sha256=actual,
+                    id=entry.get("id"),
+                    split=split,
                 )
 
 
@@ -279,6 +342,59 @@ def _base_identity(root: Path) -> str:
     )
 
 
+def _sanitize_diagnostic_text(value: object) -> str:
+    """Preserve diagnostics while removing common credential representations."""
+    reason = str(value)
+    reason = re.sub(r"(?i)(https?://)[^@/\s]+@", r"\1***@", reason)
+    reason = re.sub(
+        r"(?i)([?&](?:hf[_-]?token|token|access[_-]?token|authorization|api[_-]?key)=)[^&\s]+",
+        r"\1***",
+        reason,
+    )
+    reason = re.sub(
+        r"(?i)(\bauthorization\s*[:=]\s*(?:bearer|basic)\s+)[^\s,;]+", r"\1***", reason
+    )
+    reason = re.sub(
+        r"(?i)(\b(?:hf[_-]?token|token|access[_-]?token|api[_-]?key)\s*[:=]\s*)[^\s,;]+",
+        r"\1***",
+        reason,
+    )
+    return re.sub(r"\bhf_[A-Za-z0-9_-]+\b", "***", reason)
+
+
+def _safe_failure_reason(exc: Exception) -> str:
+    """Classify failures without ever copying untrusted exception text into details."""
+    name = type(exc).__name__.lower()
+    module = type(exc).__module__.lower()
+    if isinstance(exc, PermissionError) or any(value in name for value in ("auth", "forbidden", "unauthorized")):
+        category = "authorization"
+    elif isinstance(exc, FileNotFoundError) or any(value in name for value in ("cache", "entrynotfound", "offline")):
+        category = "cache_miss"
+    elif isinstance(exc, (ConnectionError, TimeoutError)) or any(
+        value in name or value in module for value in ("connection", "timeout", "network", "proxy")
+    ):
+        category = "network"
+    elif isinstance(exc, OSError):
+        category = "io"
+    else:
+        category = "unknown"
+    return f"{type(exc).__name__}: {category}"
+
+
+def _safe_diagnostic_value(value: object) -> object:
+    return _sanitize_diagnostic_text(value) if isinstance(value, (str, Path)) else value
+
+
+def _base_model_details(config: TrainConfig, **details: object) -> dict[str, object]:
+    return {
+        "model_name": _safe_diagnostic_value(config.model_name),
+        "revision": _safe_diagnostic_value(config.revision),
+        "local_files_only": config.local_files_only,
+        "cache": _safe_diagnostic_value(os.getenv("HF_HOME")),
+        **{key: _safe_diagnostic_value(value) for key, value in details.items()},
+    }
+
+
 def _resolve_sd15_base(config: TrainConfig) -> tuple[Path, str, str]:
     """Resolve one immutable repository snapshot before loading any component."""
     candidate = Path(config.model_name)
@@ -296,12 +412,17 @@ def _resolve_sd15_base(config: TrainConfig) -> tuple[Path, str, str]:
         ).resolve()
     except Exception as exc:
         raise PipelineError(
-            "BASE_MODEL_UNAVAILABLE", "Could not resolve the pinned SD 1.5 snapshot", retryable=True
+            "BASE_MODEL_UNAVAILABLE",
+            "Could not resolve the SD 1.5 model snapshot",
+            retryable=True,
+            details=_base_model_details(config, reason=_safe_failure_reason(exc)),
         ) from exc
     revision = root.name
     if len(revision) < 7:
         raise PipelineError(
-            "BASE_MODEL_UNAVAILABLE", "Model snapshot did not resolve to an immutable revision"
+            "BASE_MODEL_UNAVAILABLE",
+            "Model snapshot did not resolve to an immutable revision",
+            details=_base_model_details(config, resolved_root=str(root), resolved_revision=revision),
         )
     return root, revision, _base_identity(root)
 
@@ -323,9 +444,19 @@ def _load_sd15(config: TrainConfig, device):
         vae = AutoencoderKL.from_pretrained(root, subfolder="vae", **kwargs).to(device)
         unet = UNet2DConditionModel.from_pretrained(root, subfolder="unet", **kwargs).to(device)
         scheduler = DDPMScheduler.from_pretrained(root, subfolder="scheduler", **kwargs)
+    except PipelineError:
+        raise
     except Exception as exc:
         raise PipelineError(
-            "BASE_MODEL_UNAVAILABLE", "Could not load the pinned SD 1.5 model", retryable=True
+            "BASE_MODEL_UNAVAILABLE",
+            "Could not load SD 1.5 model components from the resolved snapshot",
+            retryable=True,
+            details=_base_model_details(
+                config,
+                resolved_root=str(root),
+                resolved_revision=resolved_revision,
+                reason=_safe_failure_reason(exc),
+            ),
         ) from exc
     vae.requires_grad_(False).eval()
     text_encoder.requires_grad_(False).eval()
@@ -546,9 +677,20 @@ def train(
     ``stop_after_step`` is intentionally a successful, checkpointed interruption
     point used by the smoke-test CLI; resuming keeps ``max_steps`` unchanged.
     """
+    if progress:
+        progress(
+            {
+                "phase": "training_started",
+                "current": 0,
+                "total": config.max_steps,
+                "global_step": 0,
+            }
+        )
     torch, _, F = _torch()
     output_dir = Path(output_dir)
     entries = _entries(input_manifest, "train")
+    if progress:
+        progress({"phase": "input_validation", "current": 0, "total": config.max_steps})
     validate_input_integrity(input_manifest)
     device = _safe_device(config)
     if stop_after_step is not None and not 1 <= stop_after_step <= config.max_steps:
@@ -560,14 +702,20 @@ def train(
         torch.cuda.reset_peak_memory_stats(device)
     model = None
     try:
+        if progress:
+            progress({"phase": "model_loading", "current": 0, "total": config.max_steps})
         components = _tiny_model(config, device) if config.backend == "tiny" else _load_sd15(config, device)
         model, trainable = components["unet"], components["trainable"]
+        if progress:
+            progress({"phase": "model_loaded", "current": 0, "total": config.max_steps})
         optimizer = torch.optim.AdamW(trainable, lr=config.learning_rate)
         scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda _: 1.0)
         scaler = torch.amp.GradScaler(
             device.type, enabled=device.type == "cuda" and config.precision == "fp16"
         )
         if resume_from:
+            if progress:
+                progress({"phase": "checkpoint_restoring", "current": 0, "total": config.max_steps})
             global_step, sample_cursor = _restore_checkpoint(
                 Path(resume_from),
                 model,
@@ -581,6 +729,15 @@ def train(
             checkpoint_path: Path | None = (
                 Path(resume_from) / "checkpoint.json" if Path(resume_from).is_dir() else Path(resume_from)
             )
+            if progress:
+                progress(
+                    {
+                        "phase": "checkpoint_restored",
+                        "current": global_step,
+                        "total": config.max_steps,
+                        "global_step": global_step,
+                    }
+                )
         else:
             global_step, sample_cursor = 0, 0
             checkpoint_path = None
@@ -665,6 +822,15 @@ def train(
                 or global_step == config.max_steps
                 or global_step == stop_after_step
             ):
+                if progress:
+                    progress(
+                        {
+                            "phase": "checkpoint_saving",
+                            "current": global_step,
+                            "total": config.max_steps,
+                            "global_step": global_step,
+                        }
+                    )
                 checkpoint_started = time.monotonic()
                 checkpoint_path = _atomic_checkpoint(
                     output_dir / "checkpoints",
@@ -679,7 +845,19 @@ def train(
                     base_fingerprint=components["base_fingerprint"],
                 )
                 checkpoint_seconds = time.monotonic() - checkpoint_started
+                if progress:
+                    progress(
+                        {
+                            "phase": "checkpoint_saved",
+                            "current": global_step,
+                            "total": config.max_steps,
+                            "global_step": global_step,
+                        }
+                    )
             payload = {
+                "phase": "training",
+                "current": global_step,
+                "total": config.max_steps,
                 "global_step": global_step,
                 "loss": loss_sum / config.gradient_accumulation_steps,
                 "learning_rate": optimizer.param_groups[0]["lr"],
@@ -703,7 +881,25 @@ def train(
                 progress(payload)
             if global_step == stop_after_step:
                 break
+        if progress:
+            progress(
+                {
+                    "phase": "adapter_saving",
+                    "current": global_step,
+                    "total": config.max_steps,
+                    "global_step": global_step,
+                }
+            )
         adapter = _save_adapter(model, config.backend, output_dir / "adapter")
+        if progress:
+            progress(
+                {
+                    "phase": "adapter_saved",
+                    "current": global_step,
+                    "total": config.max_steps,
+                    "global_step": global_step,
+                }
+            )
         state = "STOPPED" if global_step < config.max_steps else "COMPLETED"
         trainable_parameter_count = sum(parameter.numel() for parameter in trainable)
         total_parameter_count = sum(parameter.numel() for parameter in model.parameters())
@@ -730,6 +926,20 @@ def train(
                 "total_parameter_count": total_parameter_count,
             },
         )
+        if progress:
+            progress(
+                {
+                    "phase": "training_completed",
+                    "current": global_step,
+                    "total": config.max_steps,
+                    "global_step": global_step,
+                    "state": state,
+                    "samples_processed": sample_cursor,
+                    "samples_processed_this_run": sample_cursor - invocation_start_cursor,
+                    "samples_per_second": (sample_cursor - invocation_start_cursor)
+                    / max(time.monotonic() - start_time, 1e-9),
+                }
+            )
         return result
     except RuntimeError as exc:
         if "out of memory" in str(exc).lower():

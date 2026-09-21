@@ -7,9 +7,12 @@ normalisation step a reproducible input artifact.
 from __future__ import annotations
 
 from dataclasses import asdict
+import errno
 import hashlib
+import os
 import random
 import re
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -89,6 +92,68 @@ def _normalise_image(path: Path, config: DataConfig) -> tuple[Image.Image, str, 
     if edge_deviation < 8:
         warnings.append("possibly_blurry")
     return image, _normalized_pixel_hash(image), warnings
+
+
+def _write_normalized_image(image: Image.Image, images_dir: Path, pixel_hash: str) -> tuple[Path, str]:
+    """Publish a normalized PNG without mutating an already-published artifact.
+
+    Pixel hashes describe the decoded image, but the PNG bytes may differ between
+    Pillow versions or encoder settings.  The artifact path therefore includes
+    the hash of the encoded bytes.  Publishing a temporary file with ``link``
+    gives the first writer exclusive creation of that content-addressed path;
+    a concurrent writer can only reuse matching bytes, never overwrite them.
+    """
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=".normalizing-", suffix=".png", dir=images_dir
+    )
+    os.close(descriptor)
+    temporary_path = Path(temporary_name)
+    try:
+        image.save(temporary_path, "PNG", optimize=True)
+        with temporary_path.open("rb") as temporary_file:
+            os.fsync(temporary_file.fileno())
+        encoded_sha256 = sha256_file(temporary_path)
+        normalized_path = images_dir / f"{pixel_hash[:16]}-{encoded_sha256}.png"
+        try:
+            os.link(temporary_path, normalized_path)
+        except FileExistsError:
+            # A matching object was already safely published by an earlier or
+            # concurrent prepare.  A different one must never be replaced.
+            if sha256_file(normalized_path) != encoded_sha256:
+                raise _error(
+                    "OUTPUT_IMAGE_COLLISION",
+                    "Existing normalized image has unexpected content",
+                    path=str(normalized_path),
+                )
+        except OSError as exc:
+            if exc.errno in {errno.EPERM, errno.EXDEV, errno.EOPNOTSUPP}:
+                raise _error(
+                    "ARTIFACT_PUBLISH_UNSUPPORTED",
+                    "Filesystem does not support atomic normalized-image publishing; use a local Linux volume that supports hard links",
+                    path=str(images_dir),
+                    reason=str(exc),
+                ) from exc
+            raise
+        directory_descriptor = os.open(images_dir, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory_descriptor)
+        finally:
+            os.close(directory_descriptor)
+        return normalized_path, encoded_sha256
+    except PipelineError:
+        raise
+    except OSError as exc:
+        raise _error(
+            "ARTIFACT_PUBLISH_FAILED",
+            "Could not publish normalized image artifact",
+            path=str(images_dir),
+            reason=str(exc),
+        ) from exc
+    finally:
+        try:
+            temporary_path.unlink()
+        except FileNotFoundError:
+            pass
 
 
 def _validate_file_record(record: dict[str, Any]) -> tuple[str, str, Path]:
@@ -212,13 +277,12 @@ def prepare_dataset(
                 duplicates.append({"id": file_id, "duplicate_of": exact_hashes[pixel_hash], "reason": "exact_normalized_pixels"})
                 continue
             exact_hashes[pixel_hash] = file_id
-            normalized_path = images_dir / f"{ordinal:04d}-{pixel_hash[:16]}.png"
-            image.save(normalized_path, "PNG", optimize=True)
+            normalized_path, encoded_sha256 = _write_normalized_image(image, images_dir, pixel_hash)
             entry: dict[str, Any] = {
                 "id": file_id,
                 "name": name,
                 "path": str(normalized_path.resolve()),
-                "sha256": sha256_file(normalized_path),
+                "sha256": encoded_sha256,
                 "pixel_sha256": pixel_hash,
                 "phash": imagehash.phash(image),
                 "warnings": warnings,
@@ -227,9 +291,15 @@ def prepare_dataset(
                 entry["caption"] = raw_record["caption"]
             prepared.append(entry)
         except PipelineError as exc:
-            if exc.code == "DATASET_TOO_LARGE":
+            if exc.code in {
+                "DATASET_TOO_LARGE",
+                "OUTPUT_IMAGE_COLLISION",
+                "ARTIFACT_PUBLISH_UNSUPPORTED",
+                "ARTIFACT_PUBLISH_FAILED",
+            }:
                 # Aggregate capacity is a dataset-level admission failure,
-                # not a recoverable per-file data quality warning.
+                # as are immutable-artifact publication failures.  Neither is
+                # a recoverable per-file data quality warning.
                 raise
             rejected.append({"id": str(raw_record.get("id", ordinal)) if isinstance(raw_record, dict) else str(ordinal), "code": exc.code, "message": exc.message})
 

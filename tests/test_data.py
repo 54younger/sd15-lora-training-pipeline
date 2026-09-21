@@ -1,9 +1,13 @@
+import errno
+import os
 from pathlib import Path
+import stat
 
 import pytest
-from PIL import Image
+from PIL import Image, PngImagePlugin
 
-from lora_pipeline.common import PipelineError
+import lora_pipeline.data as data
+from lora_pipeline.common import PipelineError, sha256_file
 from lora_pipeline.config import DataConfig
 from lora_pipeline.data import generate_synthetic_dataset, prepare_dataset
 
@@ -39,6 +43,94 @@ def test_prepare_dataset_is_deterministic_and_rejects_invalid_images(tmp_path: P
     second = prepare_dataset(files, tmp_path / "two", _config(), dataset_id="repeat")
     assert [item["id"] for item in first["validation"]] == [item["id"] for item in second["validation"]]
     assert first["statistics"]["rejected"] == 1
+
+
+def test_repeated_prepare_does_not_overwrite_prior_normalized_artifacts(tmp_path: Path, monkeypatch):
+    files = generate_synthetic_dataset(tmp_path / "source", count=12, size=96)
+    output = tmp_path / "prepared"
+    first = prepare_dataset(files, output, _config(), dataset_id="repeat")
+    first_entries = first["train"] + first["validation"]
+    first_artifacts = {entry["path"]: entry["sha256"] for entry in first_entries}
+
+    original_save = Image.Image.save
+
+    def save_with_different_png_bytes(self, fp, format=None, **kwargs):
+        if format == "PNG":
+            pnginfo = PngImagePlugin.PngInfo()
+            pnginfo.add_text("encoder-variation", "second-prepare")
+            kwargs["pnginfo"] = pnginfo
+        return original_save(self, fp, format, **kwargs)
+
+    monkeypatch.setattr(Image.Image, "save", save_with_different_png_bytes)
+    second = prepare_dataset(files, output, _config(), dataset_id="repeat")
+    second_paths = {entry["path"] for entry in second["train"] + second["validation"]}
+
+    assert first_artifacts.keys().isdisjoint(second_paths)
+    assert all(sha256_file(path) == expected for path, expected in first_artifacts.items())
+    assert not list((output / "images").glob(".normalizing-*.png"))
+
+
+def test_normalized_image_syncs_file_before_its_directory(tmp_path: Path, monkeypatch):
+    images_dir = tmp_path / "images"
+    images_dir.mkdir()
+    calls: list[str] = []
+    original_fsync = data.os.fsync
+
+    def track_fsync(descriptor: int):
+        mode = os.fstat(descriptor).st_mode
+        calls.append("directory" if stat.S_ISDIR(mode) else "file")
+        return original_fsync(descriptor)
+
+    monkeypatch.setattr(data.os, "fsync", track_fsync)
+    image = Image.new("RGB", (96, 96), "red")
+    data._write_normalized_image(image, images_dir, "a" * 64)
+
+    assert "file" in calls and "directory" in calls
+    assert calls.index("file") < calls.index("directory")
+
+
+def test_prepare_preserves_legacy_ordinal_artifacts(tmp_path: Path):
+    files = generate_synthetic_dataset(tmp_path / "source", count=12, size=96)
+    image, pixel_hash, _ = data._normalise_image(Path(files[0]["path"]), _config())
+    image.close()
+    output = tmp_path / "prepared"
+    legacy_path = output / "images" / f"0000-{pixel_hash[:16]}.png"
+    legacy_path.parent.mkdir(parents=True)
+    legacy_path.write_bytes(b"legacy artifact bytes")
+
+    manifest = prepare_dataset(files, output, _config(), dataset_id="legacy")
+
+    assert legacy_path.read_bytes() == b"legacy artifact bytes"
+    assert all(
+        Path(entry["path"]) != legacy_path.resolve()
+        for entry in manifest["train"] + manifest["validation"]
+    )
+
+
+def test_prepare_fails_if_atomic_artifact_publishing_is_unsupported(tmp_path: Path, monkeypatch):
+    files = generate_synthetic_dataset(tmp_path / "source", count=12, size=96)
+
+    def unsupported_link(*_args):
+        raise OSError(errno.EXDEV, "cross-device link")
+
+    monkeypatch.setattr(data.os, "link", unsupported_link)
+    with pytest.raises(PipelineError) as error:
+        prepare_dataset(files, tmp_path / "prepared", _config())
+
+    assert error.value.code == "ARTIFACT_PUBLISH_UNSUPPORTED"
+    assert not list((tmp_path / "prepared" / "images").glob(".normalizing-*.png"))
+
+
+def test_prepare_propagates_normalized_artifact_collision(tmp_path: Path):
+    files = generate_synthetic_dataset(tmp_path / "source", count=12, size=96)
+    output = tmp_path / "prepared"
+    first = prepare_dataset(files, output, _config(), dataset_id="collision")
+    Path((first["train"] + first["validation"])[0]["path"]).write_bytes(b"corrupted artifact")
+
+    with pytest.raises(PipelineError) as error:
+        prepare_dataset(files, output, _config(), dataset_id="collision")
+
+    assert error.value.code == "OUTPUT_IMAGE_COLLISION"
 
 
 def test_prepare_dataset_fails_when_cleaning_leaves_too_few_images(tmp_path: Path):

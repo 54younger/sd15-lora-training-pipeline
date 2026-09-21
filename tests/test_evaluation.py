@@ -97,15 +97,25 @@ def test_tiny_evaluation_is_technical_only_and_never_quality_ready(tmp_path: Pat
     assert Path(report["report_path"]).is_file()
     assert updates[0]["phase"] == "evaluation_started"
     assert updates[-1]["phase"] == "evaluation_completed"
+    assert all("current" in update and "total" in update for update in updates)
+    assert {"technical_smoke_loading", "technical_smoke_completed", "report_writing"} <= {
+        update["phase"] for update in updates
+    }
 
 
 def test_tiny_ab_comparison_is_paired_but_never_claims_semantic_quality(tmp_path: Path):
     left, manifest = _completed_result(tmp_path / "left-input")
     right = train(manifest, tmp_path / "right-training", TrainConfig(**left["config"]))
-    comparison = compare_adapters(left, right, manifest, tmp_path / "comparison", EvalConfig(device="cpu"))
+    updates: list[dict] = []
+    comparison = compare_adapters(
+        left, right, manifest, tmp_path / "comparison", EvalConfig(device="cpu"), progress=updates.append
+    )
 
     assert comparison["test_only"] is True
     assert comparison["metrics"]["status"] == "semantic_metrics_unavailable_for_test_backend"
+    assert updates[0]["phase"] == "comparison_started"
+    assert updates[-1]["phase"] == "comparison_completed"
+    assert all("current" in update and "total" in update for update in updates)
 
 
 def test_ab_comparison_rejects_mismatched_resolution_before_loading_weights(tmp_path: Path):

@@ -27,6 +27,11 @@ from .training import (
 Progress = Callable[[dict], None]
 
 
+def _emit_progress(progress: Progress | None, phase: str, **details) -> None:
+    if progress:
+        progress({"phase": phase, **details})
+
+
 def cosine_similarity(left: Iterable[float], right: Iterable[float]) -> float:
     """Numerically safe cosine similarity used for CLIP diagnostics and unit tests."""
     left_values, right_values = list(left), list(right)
@@ -160,6 +165,8 @@ def _sd15_images(
     phase: str = "generation",
 ) -> list[tuple[str, int, Path]]:
     """Generate a deterministic image suite. Called only by the actual backend."""
+    total = len(config.prompts) * len(config.seeds)
+    _emit_progress(progress, f"{phase}_model_loading", current=0, total=total)
     try:
         import torch
         from diffusers import StableDiffusionPipeline
@@ -201,7 +208,7 @@ def _sd15_images(
         ) from exc
     saved: list[tuple[str, int, Path]] = []
     try:
-        total = len(config.prompts) * len(config.seeds)
+        _emit_progress(progress, f"{phase}_model_loaded", current=0, total=total)
         for prompt_index, prompt in enumerate(config.prompts):
             for seed in config.seeds:
                 generator = torch.Generator(device=device).manual_seed(seed)
@@ -219,8 +226,14 @@ def _sd15_images(
                 path.parent.mkdir(parents=True, exist_ok=True)
                 image.save(path)
                 saved.append((prompt, seed, path))
-                if progress:
-                    progress({"phase": phase, "generated_images": len(saved), "generation_total": total})
+                _emit_progress(
+                    progress,
+                    phase,
+                    current=len(saved),
+                    total=total,
+                    generated_images=len(saved),
+                    generation_total=total,
+                )
     finally:
         del pipe
         gc.collect()
@@ -230,7 +243,13 @@ def _sd15_images(
 
 
 def _clip_metrics(
-    generated: list[tuple[str, int, Path]], heldout: list[dict], training: list[dict], config: EvalConfig
+    generated: list[tuple[str, int, Path]],
+    heldout: list[dict],
+    training: list[dict],
+    config: EvalConfig,
+    *,
+    progress: Progress | None = None,
+    phase: str = "clip_scoring",
 ) -> dict:
     """CLIP is used as a diagnostic proxy, never as a claim of human quality."""
     try:
@@ -241,6 +260,8 @@ def _clip_metrics(
         raise PipelineError("DEPENDENCY_MISSING", "transformers is required for CLIP evaluation") from exc
     device = "cuda" if config.device.startswith("cuda") and torch.cuda.is_available() else "cpu"
     kwargs = {"revision": config.clip_revision, "local_files_only": config.local_files_only}
+    total = len(generated) + len(heldout) + len(training)
+    _emit_progress(progress, f"{phase}_model_loading", current=0, total=total)
     try:
         processor = CLIPProcessor.from_pretrained(config.clip_model, **kwargs)
         model = CLIPModel.from_pretrained(config.clip_model, **kwargs).to(device).eval()
@@ -253,7 +274,8 @@ def _clip_metrics(
         text_scores: list[float] = []
         pair_scores: list[dict] = []
         with torch.no_grad():
-            for prompt, seed, path in generated:
+            _emit_progress(progress, f"{phase}_model_loaded", current=0, total=total)
+            for generated_index, (prompt, seed, path) in enumerate(generated, start=1):
                 with Image.open(path) as image:
                     inputs = processor(
                         text=[prompt], images=[image.convert("RGB")], return_tensors="pt", padding=True
@@ -278,19 +300,30 @@ def _clip_metrics(
                             "clip_score": score,
                         }
                     )
+                _emit_progress(progress, phase, current=generated_index, total=total)
 
-            def embed_references(entries: list[dict], clip_model) -> list[list[float]]:
+            def embed_references(
+                entries: list[dict], clip_model, *, start: int, reference_phase: str
+            ) -> list[list[float]]:
                 reference_embeddings: list[list[float]] = []
-                for item in entries:
+                for index, item in enumerate(entries, start=1):
                     with Image.open(item["path"]) as image:
                         inputs = processor(images=[image.convert("RGB")], return_tensors="pt").to(device)
                         reference_embeddings.append(
                             clip_model.get_image_features(**inputs)[0].detach().float().cpu().tolist()
                         )
+                    _emit_progress(progress, reference_phase, current=start + index, total=total)
                 return reference_embeddings
 
-            heldout_embeddings = embed_references(heldout, model)
-            training_embeddings = embed_references(training, model)
+            heldout_embeddings = embed_references(
+                heldout, model, start=len(generated), reference_phase=f"{phase}_heldout_references"
+            )
+            training_embeddings = embed_references(
+                training,
+                model,
+                start=len(generated) + len(heldout),
+                reference_phase=f"{phase}_training_references",
+            )
         heldout_max = [
             max((cosine_similarity(item, reference) for reference in heldout_embeddings), default=0.0)
             for item in image_embeddings
@@ -316,7 +349,9 @@ def _clip_metrics(
             torch.cuda.empty_cache()
 
 
-def _sd15_technical_smoke(training_result: dict, config: EvalConfig, output_dir: Path) -> bool:
+def _sd15_technical_smoke(
+    training_result: dict, config: EvalConfig, output_dir: Path, progress: Progress | None = None
+) -> bool:
     # The first adapter image is both an adapter reload test and an inference smoke test.
     return bool(
         _sd15_images(
@@ -333,6 +368,8 @@ def _sd15_technical_smoke(training_result: dict, config: EvalConfig, output_dir:
             ),
             output_dir / "technical-smoke",
             with_adapter=True,
+            progress=progress,
+            phase="technical_smoke",
         )
     )
 
@@ -346,6 +383,8 @@ def evaluate(
 ) -> dict:
     """Evaluate one completed adapter and write both JSON and static HTML reports."""
     output_dir = Path(output_dir)
+    _emit_progress(progress, "evaluation_started", current=0, total=1)
+    _emit_progress(progress, "input_validation", current=0, total=1)
     validate_input_integrity(input_manifest)
     adapter_path = Path(training_result.get("adapter_path", ""))
     if training_result.get("state") != "COMPLETED":
@@ -363,13 +402,13 @@ def evaluate(
     if expected_input and expected_input != actual_input:
         raise PipelineError("INPUT_INCOMPATIBLE", "Evaluation manifest differs from the training input")
     start = time.monotonic()
-    if progress:
-        progress({"phase": "evaluation_started"})
     backend = _train_config(training_result).backend
     metrics: dict
     artifact_paths: dict[str, str] = {}
     if backend == "tiny":
+        _emit_progress(progress, "technical_smoke_loading", current=0, total=1)
         technical_pass = _tiny_technical_smoke(training_result)
+        _emit_progress(progress, "technical_smoke_completed", current=1, total=1)
         metrics = {
             "clip_prompt_score": None,
             "heldout_similarity": None,
@@ -379,7 +418,7 @@ def evaluate(
             "semantic_metrics_status": "unavailable_for_test_backend",
         }
     elif backend == "sd15":
-        technical_pass = _sd15_technical_smoke(training_result, config, output_dir)
+        technical_pass = _sd15_technical_smoke(training_result, config, output_dir, progress)
         heldout, training = _entries(input_manifest, "validation"), _entries(input_manifest, "train")
         # Every scored LoRA suite has an identical base-model control: prompt,
         # seed, inference steps and guidance stay fixed, leaving the adapter as
@@ -400,8 +439,12 @@ def evaluate(
             progress=progress,
             phase="adapter_generation",
         )
-        metrics = _clip_metrics(generated, heldout, training, config)
-        metrics["baseline"] = _clip_metrics(baseline, heldout, training, config)
+        metrics = _clip_metrics(
+            generated, heldout, training, config, progress=progress, phase="adapter_clip_scoring"
+        )
+        metrics["baseline"] = _clip_metrics(
+            baseline, heldout, training, config, progress=progress, phase="baseline_clip_scoring"
+        )
         metrics["paired_count"] = len(generated)
         pair_scores = {(item["prompt"], item["seed"]): item["clip_score"] for item in metrics["prompt_pairs"]}
         baseline_scores = {
@@ -442,6 +485,7 @@ def evaluate(
         "paired_outputs": paired_outputs if backend == "sd15" else [],
         "elapsed_seconds": time.monotonic() - start,
     }
+    _emit_progress(progress, "report_writing", current=0, total=1)
     report = write_manifest(output_dir / "evaluation.json", result)
     html_path = output_dir / "evaluation.html"
     atomic_write(html_path, _report_html("LoRA evaluation report", report).encode("utf-8"))
@@ -450,8 +494,13 @@ def evaluate(
         output_dir / "evaluation.json",
         {**result, "report_path": str(html_path.resolve()), "report_sha256": sha256_file(html_path)},
     )
-    if progress:
-        progress({"phase": "evaluation_completed", "quality_status": final["quality_status"]})
+    _emit_progress(
+        progress,
+        "evaluation_completed",
+        current=1,
+        total=1,
+        quality_status=final["quality_status"],
+    )
     return final
 
 
@@ -464,6 +513,8 @@ def compare_adapters(
     progress: Progress | None = None,
 ) -> dict:
     """Run an apples-to-apples paired comparison for two compatible adapters."""
+    _emit_progress(progress, "comparison_started", current=0, total=1)
+    _emit_progress(progress, "input_validation", current=0, total=1)
     validate_input_integrity(input_manifest)
     if left_training_result.get("base_model") != right_training_result.get(
         "base_model"
@@ -490,10 +541,12 @@ def compare_adapters(
     if left_backend != right_backend:
         raise PipelineError("AB_INCOMPATIBLE", "Adapters use different backends")
     if left_backend == "tiny":
-        left_ok, right_ok = (
-            _tiny_technical_smoke(left_training_result),
-            _tiny_technical_smoke(right_training_result),
-        )
+        _emit_progress(progress, "left_technical_smoke_loading", current=0, total=2)
+        left_ok = _tiny_technical_smoke(left_training_result)
+        _emit_progress(progress, "left_technical_smoke_completed", current=1, total=2)
+        _emit_progress(progress, "right_technical_smoke_loading", current=1, total=2)
+        right_ok = _tiny_technical_smoke(right_training_result)
+        _emit_progress(progress, "right_technical_smoke_completed", current=2, total=2)
         payload = {
             "kind": "ab-comparison",
             "test_only": True,
@@ -503,12 +556,30 @@ def compare_adapters(
             "paired_conditions": {"prompts": config.prompts, "seeds": config.seeds},
         }
     else:
-        left_images = _sd15_images(left_training_result, config, output_dir / "left", with_adapter=True)
-        right_images = _sd15_images(right_training_result, config, output_dir / "right", with_adapter=True)
+        left_images = _sd15_images(
+            left_training_result,
+            config,
+            output_dir / "left",
+            with_adapter=True,
+            progress=progress,
+            phase="left_generation",
+        )
+        right_images = _sd15_images(
+            right_training_result,
+            config,
+            output_dir / "right",
+            with_adapter=True,
+            progress=progress,
+            phase="right_generation",
+        )
         # Paths are deterministic per prompt/seed, and therefore are explicitly paired.
         heldout, training = _entries(input_manifest, "validation"), _entries(input_manifest, "train")
-        left_metrics = _clip_metrics(left_images, heldout, training, config)
-        right_metrics = _clip_metrics(right_images, heldout, training, config)
+        left_metrics = _clip_metrics(
+            left_images, heldout, training, config, progress=progress, phase="left_clip_scoring"
+        )
+        right_metrics = _clip_metrics(
+            right_images, heldout, training, config, progress=progress, phase="right_clip_scoring"
+        )
         delta = {
             name: right_metrics[name] - left_metrics[name]
             for name in left_metrics
@@ -547,10 +618,13 @@ def compare_adapters(
             "right_minus_left": delta,
             "paired_outputs": pairs,
         }
+    _emit_progress(progress, "comparison_report_writing", current=0, total=1)
     report = write_manifest(output_dir / "comparison.json", payload)
     html_path = output_dir / "comparison.html"
     atomic_write(html_path, _report_html("LoRA A/B comparison", report).encode("utf-8"))
-    return write_manifest(
+    final = write_manifest(
         output_dir / "comparison.json",
         {**payload, "report_path": str(html_path.resolve()), "report_sha256": sha256_file(html_path)},
     )
+    _emit_progress(progress, "comparison_completed", current=1, total=1)
+    return final
