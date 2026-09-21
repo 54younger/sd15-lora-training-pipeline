@@ -1,62 +1,77 @@
-# Deliverable 1 — System architecture
+# Part 1 — System architecture and deployment design
 
-## 1. Scope and implementation boundary
+## 1. Review boundary: implemented system versus evolution
 
-The implementation turns an owner-scoped collection of 100–1,000 images into an SD 1.5 LoRA adapter, a loading manifest and an evaluation report. It runs on **one Linux/WSL2 host**, with FastAPI, SQLite, local persistent files and a separate worker supervisor. One physical GPU runs at most one managed stage. The local validation target is an RTX 4060 Ti 16GB; CPU tests use an explicit, randomly initialized Diffusers/PEFT tiny graph plus fake slots. They never pretend that a CUDA device exists and their artifacts are test-only, not evidence of SD 1.5 quality.
+The repository implements a service on one Linux/WSL2 host: a FastAPI API, a SQLite durable queue, local persistent object directories, one worker supervisor, and a configurable pool of physical GPUs on that host. The declared dataset range is 100–1,000 images; the real backend is Stable Diffusion 1.5 attention LoRA, while the CPU tiny backend is offline regression only. Evidence: [api.py](../src/lora_pipeline/api.py), [store.py](../src/lora_pipeline/store.py), [training.py](../src/lora_pipeline/training.py), and [config.py](../src/lora_pipeline/config.py).
 
-Part 1 originally proposed PostgreSQL, versioned object storage and multi-host agents. The user selected a smaller implementation boundary for Part 2. This document and all three diagrams now describe that boundary; [the decision record](03-implementation-tradeoffs.md) preserves the reasons and migration implications.
+```
+Implemented: single-host API + SQLite + local objects/artifacts + worker + UUID GPU locks
+Not implemented: multi-host PostgreSQL, versioned object storage, remote agents, DDP/model parallelism
+```
 
-The scheduler can manage several physical GPUs on the same host, including the assignment's 2–4 GPU scenario. The default configuration uses one device. Multiple requests can be queued concurrently. The implementation does not claim distributed failover, calibrated style quality or measured GPU throughput.
+Here “2–4 GPU concurrent” means 2–4 real physical cards on one host, discovered by `nvidia-smi`, with unique UUIDs. Each UUID has one OS lock and at most one managed stage at a time. Multiple jobs may be queued concurrently, but **one job is not presented as DDP and one card is never multiplied into four**. CPU fake slots are available only with the explicit test backend; they are not evidence of CUDA concurrency or quality. GPU availability, memory and timing must come from [gpu_preflight.sh](../scripts/gpu_preflight.sh), [cli.py](../src/lora_pipeline/cli.py), and an actual acceptance run; this repository does not claim measured GPU quality or throughput.
 
-## 2. Architecture and data flow
+The Part 1 production evolution boundary is shown below (components labelled FUTURE / NOT IMPLEMENTED are **not implemented**, not part of the current deployment):
+
+```mermaid
+flowchart LR
+  C[Client] --> API["API replicas<br/>current: one process"]
+  API --> PG[(PostgreSQL<br/>FUTURE / NOT IMPLEMENTED)]
+  API --> OBJ[(Versioned object store<br/>FUTURE / NOT IMPLEMENTED)]
+  PG --> Q[Durable stage queue]
+  Q --> A1[Agent host A<br/>FUTURE / NOT IMPLEMENTED]
+  Q --> A2[Agent host B<br/>FUTURE / NOT IMPLEMENTED]
+  A1 --> G1[Physical GPU UUID locks]
+  A2 --> G2[Physical GPU UUID locks]
+  A1 --> OBJ
+  A2 --> OBJ
+  API -. current implementation .-> SQLITE[(SQLite + local files)]
+```
+
+Migration is more than changing a connection string: it needs PostgreSQL migrations/lease transactions, object versions and scoped authorization, remote-agent fencing/termination evidence, and cross-host failure drills. The current shared failure domain is the host and its disk; see the [decision record](03-implementation-tradeoffs.md).
+
+## 2. Upload-to-publication data flow
 
 ![Single-host architecture](../diagrams/system-architecture.png)
 
 [SVG](../diagrams/system-architecture.svg) · [PlantUML source](../diagrams/system-architecture.puml)
 
-1. The API authenticates a configured bearer API key, creates an upload manifest and assigns internal file IDs. Clients stream individual files through authenticated endpoints. Filenames are metadata, not filesystem paths.
-2. Upload completion freezes the recorded objects and queues verification. Job admission requires a completed dataset and atomically creates the job and first stage task. Idempotency and owner/global quotas are checked in the same transaction.
-3. CPU preparation validates decoded formats and limits, normalizes images, removes exact duplicates, groups near duplicates and freezes an approximately 90/10 group-exclusive split. Captions use supplied text first, then the configured template or BLIP backend.
-4. A singleton supervisor dispatches stage subprocesses. GPU work shares a finite pool: optional BLIP, LoRA training and evaluation compete for the same physical devices. An OS lock keyed by GPU UUID prevents managed stage overlap.
-5. Training freezes base parameters, optimizes only LoRA parameters and writes complete resumable checkpoints. Evaluation reloads the exact saved adapter, generates a paired frozen-base/LoRA suite under identical conditions, and collects quality diagnostics.
-6. Publication verifies artifact references, checksums and attempt ownership. A transaction registers one model per job and commits its terminal status. Technical success without calibration becomes `COMPLETED_UNVERIFIED`, not `READY`.
-7. The owner retrieves a manifest and adapter for a compatible inference consumer. Unverified models require explicit download opt-in. Online inference serving is outside this assignment.
+1. A client uses a configured Bearer key to create dataset metadata. `POST /v1/datasets` records only name, size, SHA-256, MIME and an optional caption; the API assigns an internal file ID, and filenames are never concatenated into paths.
+2. The client streams each raw file with `PUT`. The API enforces declared and service limits; worker/store validates the byte SHA-256 again. `POST /complete` atomically freezes uploaded objects and enters `VERIFYING`.
+3. VERIFY checks that the store dataset is still `VERIFYING`, and that each object exists with the recorded size/digest. PREPARE decodes JPEG/PNG/static WebP, normalizes EXIF/RGB/alpha, removes exact duplicates, groups perceptual near-duplicates, and freezes a group-exclusive approximately 90/10 split. Normalized output is a content-addressed PNG: the name contains a pixel-hash prefix and the final PNG-byte SHA-256; an image artifact referenced by an existing frozen manifest is never overwritten.
+4. CAPTION preserves supplied user captions. Missing entries use the selected safe template or BLIP backend, recording the trigger token, source and model revision in `training-input.json`. CUDA BLIP uses the same physical-GPU pool; template/CPU BLIP uses the bounded CPU pool.
+5. TRAIN freezes the input manifest and base revision/fingerprint, freezes the VAE, text encoder and UNet base, and optimizes attention LoRA only. At the configured checkpoint interval, final step or requested stop step, it commits adapter, optimizer, scheduler, applicable scaler, RNG, global step, sample position and compatibility identity after an optimizer update. CLI progress goes to stderr while stdout carries the final JSON.
+6. EVALUATE reloads the saved adapter, performs a technical smoke test, then generates paired base/adapter outputs with fixed prompts/seeds/steps/guidance and computes CLIP diagnostics. The default `quality_policy` is null/uncalibrated; technical success therefore may publish as `COMPLETED_UNVERIFIED`, never as an implied READY.
+7. PUBLISH rechecks the store's active attempt, adapter/report/input checksums and test-only marker, then atomically registers one model per job. `READY` requires technical success, a non-test backend, a versioned policy with a calibration reference, and passing bounds. Downloading an unverified model requires explicit `allow_unverified=true`. This is the inference-ready LoRA artifact boundary, not an online inference server.
 
-SQLite stores metadata, queue state, progress and the logical registry. Images and weights never enter database rows. File writes complete before references become visible. Database transactions remain short and do not include model execution.
-
-## 3. Lifecycle and quality boundary
+## 3. Lifecycle, states and quality gates
 
 ![Job lifecycle](../diagrams/job-lifecycle.png)
 
 [SVG](../diagrams/job-lifecycle.svg) · [PlantUML](../diagrams/job-lifecycle.puml)
 
-Job state and stage-task state are separate: a `RUNNING` job may have an `EVALUATE` task waiting in `PENDING`. A valid checkpoint is not a finished adapter, and a loadable adapter is not proof of style quality.
+Dataset store states are `UPLOADING → VERIFYING → COMPLETED | INVALID`. Job states are `ACCEPTED → RUNNING → (CANCEL_REQUESTED → CANCELLED) | FAILED | QUALITY_REJECTED | COMPLETED_UNVERIFIED | READY`; stage tasks additionally use `PENDING/RUNNING/RETRY_WAIT/SUCCEEDED/FAILED/CANCELLED`. The workflow stages are `PREPARE → CAPTION → TRAIN → EVALUATE → PUBLISH`; VERIFY is dataset verification, not a job stage. `GET /v1/training-jobs/{id}` returns job state, stage state, attempt counts and recent progress, so `RUNNING` alone never proves that a model has finished training.
 
-The default evaluation policy is uncalibrated. Reports contain technical checks, CLIP text alignment, held-out image similarity, output diversity and similarity to training images. Image similarity is a diagnostic proxy, not an independent style evaluator or proof of memorization. No universal threshold is invented. Only an operator-configured versioned policy with calibration evidence and passing required gates can authorize `READY`. Test-only artifacts can never authorize READY.
+The policy directions implemented in code are explicit: `clip_prompt_score`, `heldout_similarity` and `diversity` require `min` and/or `max`; `max_train_similarity` is commonly constrained with `max`. No measured values or default thresholds are invented here. Missing `version`, `calibration_reference` or required bounds produce `UNCALIBRATED`; an unavailable metric or out-of-bound metric in an otherwise complete policy produces `FAIL`, and EVALUATE does not enqueue PUBLISH. CLI/API test backends are always test-only and can never be READY. See [evaluation.py](../src/lora_pipeline/evaluation.py) and [test_evaluation.py](../tests/test_evaluation.py).
 
-A/B generation holds prompts, seeds, scheduler settings, inference steps and guidance constant. The default comparison is the frozen base against its LoRA; a CLI comparison also supports compatible adapters. Synthetic-data smoke tests establish execution correctness, not product quality.
-
-## 4. Resource management and recovery
+## 4. Fair resources, recovery and limits
 
 ![Local recovery](../diagrams/lease-recovery.png)
 
 [SVG](../diagrams/lease-recovery.svg) · [PlantUML](../diagrams/lease-recovery.puml)
 
-GPU dispatch uses the weighted class cycle `EVALUATE → TRAIN → CAPTION → TRAIN`, owner round-robin within each class and owner-local FIFO. Empty classes are skipped. Idle capacity can be borrowed when another owner has no eligible work; running stages are not preempted for fairness. CPU work has a separate bounded pool. The default admission limits are five nonterminal jobs per owner and 100 globally.
+- The scheduler uses the weighted `EVALUATE → TRAIN → CAPTION → TRAIN` cycle, owner round-robin within a stage, and owner-local FIFO. When multiple owners have work, an owner with active GPU work cannot keep taking every new slot. Idle cards may be borrowed; running stages are not preempted and no fictional dedicated evaluation GPU is reserved.
+- Each physical UUID has a shared OS lock; the supervisor has a singleton lock. Attempts record fencing token, PID/start time/PGID, heartbeat, lease/deadline and checkpoint/output. On expiry, the exact process must be confirmed stopped before reuse; a late result with an old token cannot commit. Infrastructure errors have at most three attempts; OOM, unsuitable data and quality rejection do not silently change parameters or retrain.
+- API and worker restarts recover persistent state on the same host through SQLite and local files. Disk or host loss is outside the fault boundary. Production deployment must take a consistent backup of the database and referenced objects; cross-host HA requires the future components above.
+- Logs are structured events; health endpoints distinguish liveness/readiness; metrics require an admin key. Progress is retained in stderr and task-attempt progress. Unmeasurable values are `null`/`not_measured`, never zero.
 
-The supervisor has a singleton file lock. Each stage has an attempt token, heartbeat, deadline and recorded process identity. A replacement supervisor checks PID, process start time and process group before acting on an orphan. Lease expiry does not release a GPU: termination and lock availability must be confirmed before reuse. The watchdog stops work on controller loss or deadline expiry. Late output from an old attempt cannot change canonical state.
+## 5. Review criteria and evidence
 
-Cancellation is durable and waits for confirmed executor termination. Recoverable infrastructure failures have at most three attempts and bounded backoff. OOM, unsuitable input and failed quality gates end explicitly; the implementation does not silently change hyperparameters or automatically retrain for quality.
-
-API and worker restarts can recover persistent state on the same host. Host or disk loss is a shared failure domain. Backups must include both the database and referenced files in a consistent stopped-service snapshot. Multi-host availability requires replacing persistence and coordinating remote execution; it is not achieved by copying this SQLite database onto a network filesystem.
-
-## 5. Evaluation criteria coverage
-
-| Criterion | Concrete implementation evidence |
+| Review criterion | Current evidence and acceptance artifact |
 |---|---|
-| ML architecture and concepts | Frozen input manifests; group-exclusive split; train-only augmentation; LoRA-only optimization; full-state resume; saved-adapter inference; paired evaluation. |
-| Code quality and architecture | Typed configuration; separate data, caption, training, evaluation, store, worker and API modules; common artifact/error contracts; CLI and automated tests. |
-| Production considerations | Owner isolation, bounded streaming uploads, idempotency, durable task transitions, cancellation, device locks, stale-attempt rejection, health checks, structured errors and metrics. |
-| Resource problem solving | One stage per device, shared evaluation capacity, weighted fair scheduling, explicit budgets, early input rejection, optional CPU captions and sequential model loading. |
+| ML architecture | Frozen manifests, group split, LoRA-only optimization, complete resume, adapter reload and paired base/adapter evaluation; see [training.py](../src/lora_pipeline/training.py) and [evaluation.py](../src/lora_pipeline/evaluation.py). |
+| Distributed/production design | Single-host durable queue, attempt fencing, lease/heartbeat, UUID GPU locks and owner fairness; multi-host PostgreSQL/object store/agents are explicitly future design, not implemented. |
+| Resource problem solving | One slot per real physical GPU, shared evaluation capacity, GPU-second budget and bounded CPU pool; acceptance must collect preflight, UUID, memory and concurrency logs, not substitute fake slots. |
+| Part 2 code/ML quality | `prepare → caption → train → evaluate` manifests, checkpoint/resume, CLIP/AB report, REST health/errors, Docker/test/benchmark runbook; see the [technical specification](02-technical-specification.md), [run guide](04-running-and-api.md), and [performance definitions](05-performance-benchmarks.md). |
 
-The [technical specification](02-technical-specification.md) defines the implemented contracts. The [run guide](04-running-and-api.md) separates offline CPU verification from user-run GPU tests. [Performance definitions](05-performance-benchmarks.md) provide measurements to collect without pretending that they have already been measured.
+The [review/assignment guide](00-assignment-guide.md) maps every deliverable to code, tests, artifacts and limitations; source files and tests are the authority for implementation claims.

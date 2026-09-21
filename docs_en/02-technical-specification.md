@@ -1,88 +1,134 @@
-# Automatic LoRA training pipeline — implementation specification
+# Part 1/2 — Technical specification, contracts and acceptance
 
-## 1. Components and persistence
+This document describes contracts present in the source, not the README's aspirations. Field implementations are in [api.py](../src/lora_pipeline/api.py), [store.py](../src/lora_pipeline/store.py), [config.py](../src/lora_pipeline/config.py), and [common.py](../src/lora_pipeline/common.py); unit/integration coverage is in [tests/](../tests/).
 
-The package `lora_pipeline` exposes a FastAPI application, an independent worker command and direct operator CLI commands. It targets Python 3.12 on Linux/WSL2. The runtime dependencies are pinned in `pyproject.toml`; no training code is fetched dynamically at runtime.
+## 1. Components, persistence and artifact lineage
 
-| Component | Responsibility |
-|---|---|
-| `api` | Bearer-key authentication, owner authorization, bounded uploads, validated requests, idempotency, status/cancel/download, health and metrics. |
-| `store` | SQLite transactions, quotas, durable queue, attempts, immutable output references, scheduler cursor and registry uniqueness. |
-| `worker` | Singleton supervisor, bounded CPU/GPU dispatch, stage subprocesses, watchdog, process identity checks, recovery and cancellation. |
-| `data` / `captions` | Decode and normalize; exact deduplication; near-duplicate grouping; frozen split; provided/template/BLIP captions. |
-| `training` | Real SD 1.5 LoRA loop and small offline test configuration, memory management, progress and complete checkpoints. |
-| `evaluation` | Fresh adapter loading, paired generation, CLIP diagnostics, quality-policy evaluation and static comparison reports. |
-| `common` / `config` | Canonical JSON/SHA-256, atomic file publication, structured errors and validated settings. |
+| Component | Current responsibility | Evidence |
+|---|---|---|
+| API | Bearer owner auth, bounded streaming uploads, request validation, required mutation idempotency, status/cancel/download, health and admin metrics | [api.py](../src/lora_pipeline/api.py) |
+| Store | SQLite schema/short transactions, quotas, queue, attempts/leases/fencing, owner isolation, unique model | [store.py](../src/lora_pipeline/store.py) |
+| Worker | Singleton supervisor, dataset VERIFY, stage children, heartbeat/watchdog, cancellation, recovery and resource dispatch | [worker.py](../src/lora_pipeline/worker.py) |
+| Data/Captions | Image decode/normalization, deduplication/group split, user/template/BLIP captions | [data.py](../src/lora_pipeline/data.py), [captions.py](../src/lora_pipeline/captions.py) |
+| Training/Evaluation | SD15 LoRA, tiny offline graph, complete checkpoint/resume, adapter reload, CLIP diagnostics and A/B | [training.py](../src/lora_pipeline/training.py), [evaluation.py](../src/lora_pipeline/evaluation.py) |
+| Common/Config | Canonical JSON, SHA-256, atomic writes, structured PipelineError and frozen settings | [common.py](../src/lora_pipeline/common.py), [config.py](../src/lora_pipeline/config.py) |
 
-SQLite uses short write transactions with `BEGIN IMMEDIATE`, foreign keys, a lock wait timeout and full synchronization. It is a single-host durable queue, not an emulation of PostgreSQL row locking. Each process opens its own connections. Only one supervisor dispatches tasks. Local files use internal keys, temporary writes and atomic publication; database records expose only completed artifact references.
+SQLite is a single-host queue: each process uses its own connection, BEGIN IMMEDIATE, foreign keys, short transactions and synchronous=FULL. Model execution and large-file IO are outside DB transactions. Main tables are datasets/dataset_files, jobs/stage_tasks/task_attempts, models, idempotency and scheduler_state. Public resources use UUIDs; times are Unix UTC seconds; digests are SHA-256. Artifact references become visible only after writes complete, and stale attempts are fenced.
 
-Logical records include datasets/files, jobs, stage tasks, attempts, models, idempotency requests and scheduler state. UUIDs identify public resources; UTC timestamps describe events; hashes are SHA-256. A job stores its fully expanded training, caption, data and evaluation settings. Attempt records link a task to a token, process identity, device, progress, deadline and checkpoint/output references. One model record is permitted per job.
+The minimum persistence schema for review is below (other timestamps/error fields are omitted). These are internal SQLite tables, not the public API schema; the external dataset files array is assembled by store.dataset(), and object_key, fencing tokens and similar internal fields are not public contract fields:
 
-## 2. Data preparation and captions
+| Table | Key fields and relation | Constraint / purpose |
+|---|---|---|
+| datasets | id, owner_id, state, declared_count, frozen_manifest_path/sha256 | Owner scoped; dataset_files.dataset_id foreign key; upload/verification state |
+| dataset_files (internal upload metadata) | id, dataset_id, object_key, size_bytes, sha256, uploaded, verification_status | object_key UNIQUE; cascade from dataset; binds bytes and source digest |
+| jobs | id, owner_id, dataset_id, state, current_stage, profile_json, training_overrides_json, model_id | Dataset foreign key; profile/input/training/evaluation JSON are frozen snapshots |
+| stage_tasks | id, job_id, candidate_index, stage, state, active_token, lease_expires_at, output_json | UNIQUE(job_id,candidate_index,stage); one successor per stage |
+| task_attempts | id, task_id, attempt_no, fencing_token, gpu_slot, process identity, progress_json | UNIQUE(task_id,attempt_no) and UNIQUE(task_id,fencing_token); stale tokens cannot write |
+| models | id, job_id, owner_id, state, adapter_path, adapter_sha256, manifest_path/sha256, report_json, test_only | UNIQUE(job_id); PUBLISH registers only checksum-verified models |
 
-Default limits: 100–1,000 declared images, at least 100 valid unique images after cleaning, 20 MiB per file, 2 GiB per dataset, 40 million decoded pixels per image and a shortest side of 256 pixels. These are configurable service limits, not measured capacity. A separate owner storage quota bounds retained uploads.
+idempotency uses (owner_id, route, key) as the primary key and stores request_sha256/response; scheduler_state stores cursors, owner rotation, leader epoch and worker heartbeat.
 
-Allowed decoded formats are JPEG, PNG and static WebP. Decode failures, animated images and exceeded limits are rejected. Normalize EXIF orientation and convert to RGB; alpha composites onto white. Hash canonical dimensions and pixels for exact deduplication. Store normalized images under generated names and record per-file rejection, duplicate and warning reasons.
+## 2. Data and manifest schema
 
-Near-duplicate grouping uses a 64-bit perceptual hash with default Hamming distance at most four; connected components stay on one side of the split. A deterministic seed controls group assignment towards 90/10. Require at least 80 training images, ten validation images and two independent groups on each side. Infeasible grouping yields `DATASET_UNSUITABLE`; insufficient valid unique images yields `DATASET_TOO_SMALL`.
+The dataset-file metadata request is:
 
-Blur, brightness and contrast are warning diagnostics by default. Artistic blur or low contrast is not silently removed. Training defaults to aspect-preserving resize and center crop; random crop and horizontal flip are explicit switches, color jitter is disabled. Validation has no random augmentation. Per-sample/epoch seeds make augmentation reproducible after resume.
+    {
+      "name": "leaf-001.png",
+      "size_bytes": 123456,
+      "sha256": "64 lowercase hex chars",
+      "mime_type": "image/png",
+      "caption": "optional printable text <= 512 chars"
+    }
 
-User captions take precedence. Missing captions use a generic image template or optional BLIP. The final caption associates the content with the configured style trigger. Captions must be nonempty bounded text without control characters; text is never executed. BLIP is loaded only when needed, with model provenance recorded. Explicit BLIP failure is not silently replaced by a template.
+POST /v1/datasets accepts {"files": [...]}. The count is 100–1,000; current DataConfig service defaults are 20 MiB per file, 2 GiB total, 40 MP and shortest side 256. Only JPEG, PNG and static WebP are accepted; animation, decode, size and digest failures are rejected or recorded as per-file rejection. prepare_dataset() writes prepared.json with:
 
-Prepared and training-input manifests preserve split membership, file identities, checksums, preprocessing version, seed, caption source and the parent manifest digest. Training, checkpoint compatibility and evaluation refer to this frozen chain.
+- schema_version, preprocessing_version, grouping_version, dataset_id and complete config;
+- train[] / validation[] entries with id/name/path/sha256/group_id and warnings;
+- statistics: submitted, accepted_unique, train/validation, groups, rejected, exact_duplicates and total_source_bytes;
+- rejected[] and duplicates[].
 
-## 3. Training and evaluation
+Normalized PNG paths contain a pixel-hash prefix and the final encoded-PNG-byte SHA-256; the digest is recorded in the entry, and a repeated prepare never overwrites a published image artifact. training-input.json also records prepared_manifest_path/sha256, captioning mode/trigger/source counts and train/validation entries. Training, evaluation and checkpoints validate this frozen chain; drift returns CHECKSUM_MISMATCH or INPUT_INCOMPATIBLE with path, expected_sha256 and actual_sha256 when available.
 
-SD 1.5 is the supported real model family. VAE, text encoder and UNet base weights remain frozen; attention LoRA weights alone are optimized. The loop encodes images to latents, samples noise and timesteps, constructs the configured scheduler target, predicts it and updates the adapter. Loss is a training-health signal, not a quality gate.
+The default split is approximately 90/10 and group-exclusive, requiring at least 80 train images, 10 validation images and two groups per side. These are configurable constraints, not a promise that every input is feasible. Blur/brightness/contrast are warnings; training defaults to aspect-preserving resize plus center crop, random crop/horizontal flip must be explicit, and validation has no random augmentation.
 
-Defaults: resolution 512, rank/alpha 4/4, batch size one, four accumulation microsteps, AdamW at `1e-4`, 500 optimizer steps, FP16 on CUDA, gradient checkpointing, gradient norm clipping at one and seed 42. Checkpoint every 50 optimizer steps and at completion. CPU test profiles use a randomly initialized Diffusers `AutoencoderKL`/`UNet2DConditionModel`/`DDPMScheduler` graph with PEFT LoRA at 16/32 resolution and FP32; they do not download pretrained weights and their artifacts remain test-only. GPU OOM produces an actionable failure without altering resolution or optimizer.
+## 3. Profiles, configuration and training/evaluation artifacts
 
-Checkpoints are committed only at optimizer boundaries. They include adapter, optimizer, LR scheduler, applicable AMP scaler, RNG state, global step and sample position. A compatibility key binds frozen inputs/captions, model revision or content, configuration, precision, accumulation, augmentation and implementation version. Partial, corrupted or incompatible checkpoints are rejected. API users cannot upload arbitrary serialized checkpoints; the trusted operator CLI can resume local pipeline-produced checkpoints.
+The actual profile IDs are:
 
-Evaluation reloads the exact saved adapter and generates a paired frozen-base/LoRA suite under identical settings. Default generation uses 20 prompts × two seeds per variant; smoke testing reduces this to two prompts × one seed per variant. CLIP text alignment uses normalized text/image features; held-out similarity, pairwise output diversity and maximum training-image similarity are diagnostic dimensions. The report records metric/model provenance, adapter/input hashes, sample counts, technical outcome and policy status. Small samples do not establish statistical significance.
+- local-sd15-v1 / key style-lora: real SD 1.5, default 512 resolution, rank/alpha 4/4, batch 1, accumulation 4, learning rate 1e-4. The smoke config uses 10 steps (configs/sd15-smoke.json), FP16 CUDA; service TrainConfig defaults max_steps to 500, not a measured quality threshold.
+- local-tiny-v1 / key tiny-test: exposed only with enable_test_backend=true; CPU FP32, 16px randomly initialized Diffusers/PEFT graph, always test-only artifacts.
 
-The default policy is uncalibrated. Technical success registers an `UNVERIFIED` model and ends the job as `COMPLETED_UNVERIFIED`. `READY` requires technical success and a passing versioned calibrated policy with evidence. A failed calibrated policy yields `QUALITY_REJECTED`. Test-only models never become READY. A/B reports provide paired images and per-pair score differences; the comparison API is also available as an operator CLI for two compatible adapters.
+The expanded profile/data/evaluation/caption/limits snapshot is frozen at admission. API training overrides are limited to max_steps, learning_rate, rank, lora_alpha, checkpoint_every, seed, batch_size and gradient_accumulation_steps. The API cannot select a base model, device, precision, path, remote URL or arbitrary checkpoint.
 
-## 4. API contract and state model
+A training result includes at least kind=training-result, state, adapter_path/adapter_sha256, manifest_path/manifest_sha256, input_manifest_sha256, base revision/fingerprint, config, global_step, elapsed_seconds and test_only. A checkpoint contains adapter, optimizer, LR scheduler, applicable AMP scaler, RNG, sample cursor and compatibility key. It is saved only at the configured checkpoint boundary; corrupt, partial or input/config/base mismatches are CHECKPOINT_CORRUPT or CHECKPOINT_INCOMPATIBLE.
 
-All resource endpoints require `Authorization: Bearer <key>`. Configured keys map to owner IDs; cross-owner requests return `404`. Health endpoints expose bounded operational status; `/metrics` requires an operator-authorized key. There is no account registration or external identity-provider integration.
+Frozen revision contract: SD15 training must resolve an immutable snapshot revision and write revision plus base fingerprint into training-result/checkpoint; evaluation accepts only the same revision/fingerprint, while drift or an unpinned snapshot is BASE_SNAPSHOT_MISMATCH or BASE_REVISION_UNPINNED. Tiny tests use an explicit local identity and never pretend to be an SD15 revision.
 
-Dataset states: `UPLOADING → VERIFYING → COMPLETED | INVALID`. Job states: `ACCEPTED`, `RUNNING`, `CANCEL_REQUESTED`, `CANCELLED`, `FAILED`, `QUALITY_REJECTED`, `COMPLETED_UNVERIFIED`, `READY`. Stages are `PREPARE`, `CAPTION`, `TRAIN`, `EVALUATE`, `PUBLISH`; verification is separate dataset work. Task states distinguish pending, running, retries and terminal completion.
+Base-snapshot failure diagnostics retain actionable fields while redacting model/revision/cache URLs and tokens; HF tokens and raw exception URLs are not written into error details. See the base-model diagnostic cases in [test_training.py](../tests/test_training.py).
 
-| Method and path | Request and behavior |
-|---|---|
-| `POST /v1/datasets` | File metadata list: name, size_bytes, sha256, mime_type and optional caption. Returns dataset ID and file upload identifiers. |
-| `PUT /v1/datasets/{id}/files/{file_id}` | Raw file bytes; streaming size/hash validation; repeated matching upload is safe; frozen data cannot be replaced. |
-| `POST /v1/datasets/{id}/complete` | Empty object; freeze recorded objects and queue verification; return 202. |
-| `GET /v1/datasets/{id}` | State, verification counters and actionable errors. |
-| `GET /v1/training-profiles` | Available real or explicitly enabled test profile with allowed parameter overrides. |
-| `POST /v1/training-jobs` | dataset_id, profile identifier, trigger_token and supported training overrides; atomic admission returns 202. |
-| `GET /v1/training-jobs/{id}` | Job and stage state, attempts, progress, timestamps, error and model reference when available. |
-| `POST /v1/training-jobs/{id}/cancel` | Persist cancellation; terminal publication cannot be undone by late cancel. |
-| `GET /v1/training-jobs/{id}/evaluation` | Owner-scoped evaluation report; unavailable reports return conflict. |
-| `GET /v1/models/{id}` | Model metadata, provenance, quality status and artifacts. |
-| `GET /v1/models/{id}/download` | Owner-authorized artifact delivery; UNVERIFIED requires `allow_unverified=true`. |
-| `GET /health/live`, `/health/ready` | Process liveness and dependency/worker readiness. |
+An evaluation report contains technical_pass, quality_status, quality_failures, metrics, test_only, adapter/input/base identity, config, paired_outputs and report_path/report_sha256. SD15 metrics are CLIP prompt score, held-out similarity, diversity, maximum training similarity, baseline and paired count; tiny metrics explicitly report unavailable. A/B uses identical prompt/seed/inference settings and rejects adapters with different base revision, resolution or input manifest.
 
-Mutation endpoints use `Idempotency-Key`, scoped to owner, method and concrete route; identical requests replay their original result and changed bodies conflict. File-upload idempotency is tied to file ID/checksum. Upload names are never concatenated into paths. Requests cannot select arbitrary server paths, base-model code or remote URLs.
+The quality-policy shape and directions are implementation facts, not business defaults:
 
-Errors have `error.code`, `message`, `retryable`, `details` and `request_id`. Typical categories: 401 authentication; 404 missing/unauthorized resource; 409 invalid state or idempotency conflict; 422 unusable configuration/data; 429 admission/storage quota; 503 unavailable dependency. FastAPI's generated OpenAPI is the executable schema; see the [run/API guide](04-running-and-api.md) for a reproducible client.
+    {
+      "version": "operator-defined",
+      "calibration_reference": "operator-supplied evidence identifier",
+      "bounds": {
+        "clip_prompt_score": {"min": 0.0},
+        "heldout_similarity": {"min": 0.0},
+        "diversity": {"min": 0.0},
+        "max_train_similarity": {"max": 1.0}
+      }
+    }
 
-## 5. Scheduling, recovery and operational bounds
+The example numbers above are placeholders only; runtime bounds must be finite numbers. Code checks that the reference is non-empty, bounds are present and numeric, min is no greater than max, and values obey the direction. It does **not** read, validate or prove that the external calibration_reference exists, and the repository contains no calibrated data or measured thresholds. Default null yields UNCALIBRATED; technical success plus a non-test backend and policy PASS yields READY; PASS for test-only remains UNCALIBRATED. A complete policy with an unavailable metric is FAIL; a missing/incomplete policy is UNCALIBRATED. FAIL after EVALUATE enters QUALITY_REJECTED and does not enqueue PUBLISH.
 
-GPU devices are discovered by UUID. Configured UUIDs must be unique and available; CPU fake slots require an explicit test setting. Each physical GPU has one shared OS lock used by both worker and direct CLI GPU commands. The supervisor singleton lock prevents competing local dispatchers.
+## 4. State machine and actual store checks
 
-Dispatch uses the weighted `EVALUATE, TRAIN, CAPTION, TRAIN` cycle and persisted owner rotation. With other eligible owners, one owner cannot take all newly available slots. CPU stages use a separate bounded pool. No evaluation GPU is permanently reserved.
+| Work item | State/order | Worker/store check |
+|---|---|---|
+| Dataset VERIFY | UPLOADING → VERIFYING → COMPLETED/INVALID | complete_dataset requires every file uploaded=1; worker checks object existence, size and source SHA; finish_verification writes counts, error and frozen manifest. VERIFY is dataset work, **not a stage task**. |
+| Job stages | PREPARE → CAPTION → TRAIN → EVALUATE → PUBLISH | claim_task only claims job ACCEPTED/RUNNING and task PENDING/RETRY_WAIT; each task has an attempt token/lease. |
+| PREPARE | task PENDING/RUNNING/SUCCEEDED... | Builds trusted entries from store object keys and writes the prepared manifest; if every train caption exists it may create input in the same completion, otherwise it creates CAPTION. |
+| CAPTION | same task states | Reads mode/device/model/revision from the frozen job profile; user text wins and BLIP failure never silently falls back to a template. |
+| TRAIN | same task states | Reads only frozen input/profile/overrides; a physical GPU uses assigned cuda:0, a test slot forces tiny CPU; saves checkpoints and progress. |
+| EVALUATE | same task states | Requires training/input; rechecks adapter/input/base. Quality FAIL writes QUALITY_REJECTED and creates no PUBLISH task. |
+| PUBLISH | independent successor task | Requires active token, live lease, existing checksum-valid adapter/manifest/report/input binding; models.job_id is UNIQUE and terminal state is READY or COMPLETED_UNVERIFIED. |
 
-Default heartbeat is ten seconds, lease 60 seconds, per-stage limit 3,600 seconds and cumulative GPU-stage budget 7,200 seconds. These are configurable protective defaults, not throughput estimates. Each task has at most three infrastructure attempts. Cancellation, deadline or lost control heartbeat initiates termination of the exact stage process group. A process identity includes PID and start time to avoid killing a reused PID. Device reuse requires confirmed process exit and lock availability.
+Terminal job states are READY, FAILED, QUALITY_REJECTED, CANCELLED and COMPLETED_UNVERIFIED. Cancellation persists CANCEL_REQUESTED and becomes CANCELLED only when no executor remains. Lease expiry first checks the PID/start-time/PGID process identity; an old fencing token cannot update canonical progress/output.
 
-All canonical progress/output updates check the active attempt token and permissible job/task state. Completion atomically binds output and enqueues the unique successor. Publication checks the adapter, report and input binding and registers a unique model. Work may be retried; publication remains unique.
+## 5. REST API, idempotency and schema
 
-The API supports structured request/job logs and an authenticated metrics endpoint. GPU memory and training measurements live in progress/artifact reports; unmeasurable values are explicit rather than zero. No automatic garbage collection removes referenced objects. Retention and consistent backups are operator responsibilities in this minimal implementation; multi-host failover and a production calibrated style evaluator remain outside the implemented boundary.
+All resource endpoints use Authorization: Bearer <key>; cross-owner lookups are masked as 404 NOT_FOUND. Current endpoints:
 
-## 6. Acceptance scenarios
+| Method | Path | Input/output |
+|---|---|---|
+| POST | /v1/datasets | files[] metadata; 201 returns dataset/file IDs. **Idempotency-Key required.** |
+| PUT | /v1/datasets/{dataset_id}/files/{file_id} | Raw bytes, streaming size/hash validation, 204. Retry is safe by file ID and checksum; it is upload identity logic, **not the generic idempotency table and does not require Idempotency-Key**. |
+| POST | /v1/datasets/{dataset_id}/complete | Empty JSON; freeze and queue VERIFY, 202 + Location. **Key required.** |
+| GET | /v1/datasets/{id} | State, counts, errors and optional files. |
+| GET | /v1/training-profiles | Actual profile IDs, frozen config and limits. |
+| POST | /v1/training-jobs | dataset_id/profile_revision_id/trigger_token/training_overrides; 202 + status URL. **Key required.** |
+| GET | /v1/training-jobs/{id} | Job/stages/attempts/progress/error/model. |
+| POST | /v1/training-jobs/{id}/cancel | Empty JSON; 202 CANCEL_REQUESTED. **Key required.** |
+| GET | /v1/training-jobs/{id}/evaluation | Report; unavailable report is a conflict. |
+| GET | /v1/models/{id} | Owner-scoped model/report/provenance/state. |
+| GET | /v1/models/{id}/download?allow_unverified=true | Adapter bytes; an UNVERIFIED model without opt-in is 409. |
+| GET | /health/live, /health/ready | Liveness; readiness checks DB, storage and worker heartbeat and returns 503 when not ready. |
+| GET | /metrics | Admin-key Prometheus text; non-admin is 401. |
 
-Critical tests cover malformed/oversized images, exact duplicates and group leakage; deterministic augmentation and split; caption priority and explicit BLIP failures; frozen base weights and real LoRA gradients; complete checkpoint restoration and incompatibility rejection; metric arithmetic and A/B pairing; tenant isolation and idempotency; admission limits and fair logical slots; stale-result rejection, cancellation and worker recovery; unique publication and explicit unverified downloads.
+Required POST mutations store (owner, concrete route, Idempotency-Key) and request hash in idempotency. Same key and body replays the original response; a changed body is 409 IDEMPOTENCY_KEY_REUSED. Reads, health and metrics do not require it. PUT relies on file-object byte identity and frozen-state checks. API errors have this fixed shape:
 
-Offline CPU tests use synthetic image fixtures and a locally initialized Diffusers/PEFT tiny graph with random weights. They do not download pretrained model weights, and the resulting artifacts are test-only. The user-run RTX 4060 Ti test performs ten real optimizer steps with interruption at five, resumes, exports/reloads an adapter, generates paired images and computes CLIP metrics. GPU outcomes remain unverified until that command is actually run. Container build/runtime status is reported separately when Docker daemon access is unavailable.
+    {"error":{"code":"...","message":"...","retryable":false,"details":{},"request_id":"uuid"}}
+
+PipelineError exceptions are wrapped by api.py's middleware/exception handler into the error object above and mapped by code: 401 for UNAUTHORIZED, 404 for NOT_FOUND, 409 for listed state/idempotency conflicts, 429 for ADMISSION_LIMIT, 503 for GPU_UNAVAILABLE or WORKER_ALREADY_RUNNING, and 422 for other PipelineError values including storage quota. Pydantic/FastAPI request validation errors (for example, a wrong body field type) instead use the default RequestValidationError response: HTTP 422 with a detail array, not the unified error wrapper. FastAPI's generated OpenAPI is the executable schema; a future PostgreSQL API is not a current contract.
+
+## 6. CLI errors, progress, logs and acceptance
+
+On success CLI stdout is final JSON; train/evaluate/compare progress is line-oriented stderr (phase, current/total and percentage). Failure exits 1 and prints:
+
+    {"error":{"code":"CHECKSUM_MISMATCH","message":"...","details":{}}}
+
+CLI errors do not carry API HTTP status/retryable/request_id fields. The worker emits structured stage_started/stage_completed/stage_failed events and writes attempt progress to SQLite. Training progress includes global_step, loss, samples_processed, samples_per_second, checkpoint_seconds, CPU RSS and CUDA allocated/reserved when available; unavailable measurements stay null/not_measured. [test_cli.py](../tests/test_cli.py) and [test_observability.py](../tests/test_observability.py) verify the output boundary.
+
+Acceptance must separate three results: offline pytest/tiny proves logic, LoRA/resume and contracts; Docker Compose proves image/service configuration; real SD15 with 2–4 physical GPUs, CLIP and performance benchmarks must run on target hardware. Unrun fields remain not_measured; CPU tiny values must not be presented as GPU quality or throughput. Entry points and success criteria are in the [run/API guide](04-running-and-api.md) and [performance definitions](05-performance-benchmarks.md).

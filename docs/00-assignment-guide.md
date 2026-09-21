@@ -1,0 +1,29 @@
+# 作业评审导航：要求、证据、验收与限制
+
+这是一页式导航，不重复 README 的运行手册。评审时先看[系统架构](01-system-architecture.md)、[技术规格](02-technical-specification.md)、[实现取舍](03-implementation-tradeoffs.md)，再按本矩阵核验源码和测试。**当前源码是事实来源；未运行的 GPU/质量数字不得补写。**
+
+## 交付/标准覆盖矩阵
+
+| 作业要求/评审问题 | 实现证据 | 直接测试/验收 artifact | 验收条件与限制 |
+|---|---|---|---|
+| Part 1：100–1,000 图上传→部署/发布 | [api.py](../src/lora_pipeline/api.py)、[data.py](../src/lora_pipeline/data.py)、[worker.py](../src/lora_pipeline/worker.py)、[store.py](../src/lora_pipeline/store.py)；数据流和状态见[架构](01-system-architecture.md) | [test_system_e2e.py](../tests/test_system_e2e.py)、[test_service_contracts.py](../tests/test_service_contracts.py)；prepared/training/evaluation manifests、adapter.safetensors、model record | 全部文件上传、VERIFY/prepare 完成、训练/评估 checksum 绑定后才能 PUBLISH；单机本地对象，在线 serving 未实现。 |
+| Part 1：scale、fault tolerance、生产部署 | UUID GPU slot、CPU bounded pool、weighted scheduler、lease/heartbeat/fencing、atomic publication；未来 PostgreSQL/versioned object store/agents 图明确未实现 | [test_scheduler_recovery.py](../tests/test_scheduler_recovery.py)、[test_service_review_fixes.py](../tests/test_service_review_fixes.py)、[test_observability.py](../tests/test_observability.py)；lease/process/token/structured-log evidence | 2–4 张真实物理 GPU 是同一主机多卡、多 job 并发，每卡一个 slot；不是单 job DDP、不是 fake slot 冒充。主机/磁盘丢失不保证恢复。 |
+| Part 1：组件、API、schema、错误 | API/Store/Worker/Data/Train/Eval 分层，OpenAPI 和[技术规格](02-technical-specification.md) | [test_service_contracts.py](../tests/test_service_contracts.py)、[test_service_review_fixes.py](../tests/test_service_review_fixes.py)、[test_cli.py](../tests/test_cli.py)；PipelineError API error JSON、FastAPI validation detail、CLI stderr error、health/metrics | Idempotency-Key 只用于 POST dataset/complete/job/cancel；PUT file 按 file ID+checksum 重试，不用通用 idem 表。 |
+| Part 2：preprocess、caption、split、augment、filter | [data.py](../src/lora_pipeline/data.py)、[captions.py](../src/lora_pipeline/captions.py)：JPEG/PNG/static WebP、EXIF/RGB/alpha、精确/近重复、group split、warning、user/template/BLIP | [test_data.py](../tests/test_data.py)、[test_captions.py](../tests/test_captions.py)、[test_image_boundaries.py](../tests/test_image_boundaries.py)；prepared.json、training-input.json、内容寻址 PNG | 最少有效 unique、train/validation/groups 门禁；blur/contrast 默认 warning；normalized PNG 按最终编码字节 SHA-256 寻址，旧 image artifact 不覆盖。 |
+| Part 2：config、LoRA、memory、checkpoint/resume、progress | [config.py](../src/lora_pipeline/config.py)、[training.py](../src/lora_pipeline/training.py)、[cli.py](../src/lora_pipeline/cli.py)：真实 profile local-sd15-v1；tiny local-tiny-v1 仅测试 | [test_common_config.py](../tests/test_common_config.py)、[test_training.py](../tests/test_training.py)、[test_cli.py](../tests/test_cli.py)；checkpoint JSON/adapter、stderr progress、stdout final JSON | batch 1/accumulation 4 的 optimizer step 与 microstep 分开；FP16+gradient checkpointing 是显存/计算取舍；只在配置 boundary 保存，GPU OOM 不偷偷改参数。 |
+| Part 2：eval、CLIP/similar、A/B | [evaluation.py](../src/lora_pipeline/evaluation.py)：technical smoke、base/adapter fixed prompt+seed、CLIP diagnostics、paired comparison、policy | [test_evaluation.py](../tests/test_evaluation.py)、[test_system_e2e.py](../tests/test_system_e2e.py)；evaluation.json/html、paired outputs、quality_status | CLIP 是诊断 proxy，不是 FID/主观风格证明；默认 policy null。policy 配置完整但运行时指标不可用 → FAIL；policy 缺失或缺 required bounds/calibration metadata → UNCALIBRATED。代码不验证 calibration_reference 外部证据。 |
+| Part 2：REST health、errors、logging | [api.py](../src/lora_pipeline/api.py)、[observability.py](../src/lora_pipeline/observability.py) | [test_observability.py](../tests/test_observability.py)、[test_service_contracts.py](../tests/test_service_contracts.py)；/health/live、/health/ready、/metrics、structured events | ready 同时以 DB/storage/worker 状态决定 200/503；metrics 要 admin key；API 与 CLI error shape 不同。 |
+| Part 2：Docker、tests、benchmark | [Dockerfile](../Dockerfile)、[compose.yaml](../compose.yaml)、[compose.gpu.yaml](../compose.gpu.yaml)、[VALIDATION.md](../VALIDATION.md) | 全部 pytest；Docker config/build/preflight runbook；[性能定义](05-performance-benchmarks.md) | 本环境已可做离线测试/配置解析；Docker daemon、真实 GPU、SD15/BLIP/CLIP benchmark 如未运行必须记 not_measured。不得把 tiny CPU 当真实质量/吞吐。 |
+| 评价：ML architecture、code quality、production、resource creativity | 冻结 manifest、LoRA-only、完整 resume、owner isolation、idempotency、fair resource、fencing、atomic publish | 上述 tests 加[架构评审](01-system-architecture.md)和[取舍记录](03-implementation-tradeoffs.md) | 评审应区分已实现单机与未来多机，不因 Mermaid 演进图给未实现组件加分为已部署能力。 |
+
+## 证据链与 inference-ready 定义
+
+一次可复核的真实交付应能从 dataset/file IDs 追到 frozen prepared.json → training-input.json → training-result/checkpoint → evaluation.json/html → PUBLISH model record。inference-ready artifact 至少绑定 adapter.safetensors、adapter SHA-256、base revision/fingerprint、trigger token、inference config 和 evaluation report；它不等于 READY，也不等于在线 serving。默认无业务质量认证，UNVERIFIED 下载需要显式 opt-in。
+
+## 测试文件索引
+
+以下是当前测试目录的直接评审入口：
+
+[test_captions.py](../tests/test_captions.py) caption 优先级/BLIP 失败；[test_cli.py](../tests/test_cli.py) stdout/stderr；[test_common_config.py](../tests/test_common_config.py) canonical/config；[test_data.py](../tests/test_data.py) prepare、dedup、group、PNG 原子发布；[test_evaluation.py](../tests/test_evaluation.py) metric/policy/A-B；[test_image_boundaries.py](../tests/test_image_boundaries.py) format/尺寸/alpha/EXIF；[test_observability.py](../tests/test_observability.py) logs/metrics；[test_scheduler_recovery.py](../tests/test_scheduler_recovery.py) slots、lease、fairness、budget、recovery；[test_service_contracts.py](../tests/test_service_contracts.py) API/idempotency/health/download；[test_service_review_fixes.py](../tests/test_service_review_fixes.py) fencing/cancel/deadline；[test_system_e2e.py](../tests/test_system_e2e.py) API→worker→unverified end-to-end；[test_training.py](../tests/test_training.py) LoRA、冻结参数、resume、checksum。
+
+运行时以仓库实际 tests/ 为准；以上覆盖当前每个测试文件。

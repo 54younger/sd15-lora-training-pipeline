@@ -2,12 +2,13 @@
 
 这是 Automatic LoRA Training Pipeline 作业的单机实现。流水线接收 100–1,000 张用户图片，完成验证、caption、分组划分、Stable Diffusion 1.5 attention LoRA 训练、checkpoint 恢复、评估、发布和下载。FastAPI 与独立 worker 用 SQLite 和本地制品目录协作；目标主机上的 worker 按物理 GPU UUID 分配 slot，让 2–4 张 GPU 可以安全承接并发任务。
 
-本文按两个 assignments 编排。Part 2 以真实 GPU Docker 验证为主线：每个模块都有职责、命令、制品与成功判据，最后用三次真实训练得到 benchmarks。tiny CPU 后端仅用于离线回归，不能作为 SD 1.5 质量或 GPU 性能结论。
+本文按两个 assignments 编排。Part 2 以真实 GPU Docker 验证为主线：每个模块都有职责、命令、制品与成功判据，最后提供三次真实训练的 benchmark 采集流程。tiny CPU 后端仅用于离线回归，不能作为 SD 1.5 质量或 GPU 性能结论。
 
 当前开发环境已完成 Python 测试、CPU tiny smoke、Compose 配置解析；Docker daemon 和真实 GPU 未在此环境运行。GPU 命令是目标主机验收 runbook，未测字段必须保持 null/not_measured。完整边界见 [VALIDATION.md](VALIDATION.md)。
 
 ## 交付物映射
 
+按 assignment 逐项审阅可从 [评审导航与验收证据](docs/00-assignment-guide.md) 开始；[English assessment guide](docs_en/00-assignment-guide.md) 提供对应的英文要求映射。
 
 | 作业交付                           | 仓库证据                                                                                         |
 | ---------------------------------- | ------------------------------------------------------------------------------------------------ |
@@ -51,7 +52,7 @@ flowchart LR
 | Evaluation / Publish | 重载 adapter 做技术检查；真实 SD 1.5 在固定 prompt/seed 下产生 base/adapter 配对与 CLIP 诊断。未校准 policy 的成功是 COMPLETED_UNVERIFIED/UNVERIFIED。      |
 | 调度/容错            | 每张物理 GPU 一个 OS 锁；owner 轮转、FIFO、时限、GPU 秒预算、取消与重试处理竞争。SQLite/本地卷是单机共同故障域；多机须换共享 DB、对象存储和远程执行器。     |
 
-REST API 提供 dataset 上传、training profile/job、evaluation/model 下载、health 和 metrics。错误 JSON 固定含 code、message、retryable、details、request_id；精确 schema 见运行时 /docs 和 [技术规格](docs/02-technical-specification.md)。
+REST API 提供 dataset 上传、training profile/job、evaluation/model 下载、health 和 metrics。业务 `PipelineError` 的 JSON 含 code、message、retryable、details、request_id；框架请求体校验错误仍使用 FastAPI 的 `422 {"detail":[...]}`，客户端应兼容两种格式。精确 schema 见运行时 /docs 和 [技术规格](docs/02-technical-specification.md)。
 
 ## Part 2：GPU Docker 前提
 
@@ -152,7 +153,7 @@ export DATASET_DIR="${DATASET_DIR:-$PWD/datasets/ibean/images}"
 test -d "$DATASET_DIR" || { echo "DATASET_DIR does not exist: $DATASET_DIR" >&2; exit 1; }
 prepare_ibean_data() {
 # heredoc 通过 stdin 传入脚本；-T 禁用 Compose 默认分配的伪终端，兼容 SSH/CI/重定向执行。
-dc run --rm --no-deps -i -T -v "$DATASET_DIR:/input:ro" worker python - <<'PY'
+dc run --rm --no-deps -i -T -v "$DATASET_DIR:/input:ro" worker python - <<'PY' || return 1
 import json
 from pathlib import Path
 root = Path("/input")
@@ -174,7 +175,6 @@ dc run --rm --no-deps worker lora-pipeline caption \
   --mode template --trigger-token mystyle
 }
 prepare_ibean_data
-unset -f prepare_ibean_data
 ~~~
 
 这里的 `/data` 是**容器内路径**，由 Compose 挂载到 `pipeline-data` named volume，并不对应宿主机的 `/data` 目录。因此三个一次性容器会共享生成的 manifest，容器被 `--rm` 删除后文件仍保留在 volume 中，但不能直接在宿主机执行 `ls /data/real-input` 查找。`DATASET_DIR` 只需挂载到读取原图的前两个容器。
@@ -257,7 +257,7 @@ dc run --rm --no-deps -v "$PWD/configs:/workspace/configs:ro" worker \
   --resume /data/sd15-smoke-training/checkpoints/step-00000005/checkpoint.json
 ~~~
 
-CLI 在 stderr 逐行显示当前阶段、文本进度条、current/total 和百分比，包括 input validation、model loading、training、checkpoint、adapter saving；不需要另开 terminal 才能看到进度。每个训练 step 的后端 progress 仍记录 global_step、loss、samples_processed、samples_processed_this_run、samples_per_second、checkpoint_seconds、cpu_rss_bytes，以及 CUDA 的 gpu_memory_allocated/reserved，供 worker/API 查询。stdout 只保留最终结果 JSON，便于脚本解析；不要用会吞掉失败码的 pipe。training-result.json 记录 adapter checksum、配置、基座 revision/fingerprint、input hash、参数量与 elapsed_seconds。
+CLI 在 stderr 逐行显示当前阶段、文本进度条、current/total 和百分比，包括 input validation、model loading、training、checkpoint、adapter saving；不需要另开 terminal 才能看到进度。训练 step 的后端 progress 记录 global_step、loss、samples_processed、samples_processed_this_run、samples_per_second；仅保存 checkpoint 的 step 带 checkpoint_seconds，cpu_rss_bytes 和 CUDA gpu_memory_allocated/reserved 在可用时附带，供 worker/API 查询。stdout 只保留最终结果 JSON，便于脚本解析；不要用会吞掉失败码的 pipe。training-result.json 记录 adapter checksum、配置、基座 revision/fingerprint、input hash、参数量与 elapsed_seconds。
 
 **成功判据：** result 为 COMPLETED，global_step 为 10，并有 adapter/adapter.safetensors。输入/基座/数值配置不匹配为 CHECKPOINT_INCOMPATIBLE，损坏 checkpoint 为 CHECKPOINT_CORRUPT，OOM 为 GPU_OUT_OF_MEMORY；不会自动换参数重跑。
 
@@ -265,7 +265,7 @@ CLI 在 stderr 逐行显示当前阶段、文本进度条、current/total 和百
 
 **对应要求：** 质量评估、性能指标收集、A/B framework。
 
-evaluate 先重新加载 adapter 做技术检查，再以固定 prompt、seed、steps、guidance 为 base/LoRA 生成配对输出。真实 SD 1.5 报告 CLIP prompt score、held-out similarity、diversity、max train similarity、base 对照、evaluation.html/json。项目没有 FID；这些诊断也不能单独证明风格质量。先建立与真实数据集的主体/风格匹配的 prompt 配置；下面的 portrait 文本只保证命令可运行，必须替换为该数据集的真实评估 prompts。
+evaluate 先重新加载 adapter 做技术检查，再以固定 prompt、seed、steps、guidance 为 base/LoRA 生成配对输出。真实 SD 1.5 报告 CLIP prompt score、held-out similarity、diversity、max train similarity、base 对照、evaluation.html/json。项目没有 FID；这些诊断也不能单独证明风格质量。下面用与 IBean 叶片主题对应的 prompts 验证链路；它们不构成经校准的质量评测集，使用其他数据集时应相应替换。
 
 Evaluation 同样在 stderr 显示当前阶段和进度条，包括 technical smoke、base/adapter generation、CLIP model loading、generated/held-out/train reference scoring 和 report writing；stdout 只输出最终 evaluation JSON。模型加载阶段百分比保持在 0% 并不表示卡死，应等待进入逐图 generation/scoring；若失败则以非零退出并在 stderr 返回结构化 error。
 
@@ -274,7 +274,7 @@ dc run --rm --no-deps -i -T -v "$PWD/configs:/workspace/configs:ro" worker pytho
 import json
 from pathlib import Path
 config=json.loads(Path("/workspace/configs/evaluation-smoke.json").read_text())
-config["prompts"]=["a portrait photograph in mystyle style", "a full-body portrait in mystyle style"]
+config["prompts"]=["a close-up photograph of a healthy bean leaf in mystyle style", "a close-up photograph of a bean leaf with bean rust in mystyle style"]
 Path("/data/real-evaluation.json").write_text(json.dumps(config))
 PY
 dc run --rm --no-deps -v "$PWD/configs:/workspace/configs:ro" worker \
@@ -352,7 +352,7 @@ with httpx.Client(base_url="http://api:8000",timeout=120) as c:
   time.sleep(1)
  else:raise TimeoutError("dataset verification")
  ps=c.get("/v1/training-profiles",headers=h).json()["profiles"]; p=next(x for x in ps if x["profile_revision_id"]=="local-sd15-v1")
- job=post(c,"/v1/training-jobs",{"dataset_id":dsid,"profile_revision_id":p["profile_revision_id"],"trigger_token":"mystyle","training_overrides":{"max_steps":int(os.environ.get("API_MAX_STEPS","500"))}});jid=job.get("job_id",job["id"])
+ job=post(c,"/v1/training-jobs",{"dataset_id":dsid,"profile_revision_id":p["profile_revision_id"],"trigger_token":"mystyle","training_overrides":{"max_steps":int(os.environ.get("API_MAX_STEPS","500"))}});jid=job["job_id"]
  end=time.monotonic()+7500
  while time.monotonic()<end:
   job=c.get(f"/v1/training-jobs/{jid}",headers=h).json()
@@ -439,7 +439,7 @@ dc up -d api worker
 
 10-step smoke 只验证模块。正式 benchmark 固定同一真实 training-input.json、已缓存 SD 1.5 revision、同一 GPU 和同一配置，先运行一次不计统计的 warm-up，再运行至少三次**完整**训练。总 wall time 包含模型加载；steady-state 从 optimizer step 11 开始，明确排除加载和前 10 个 warm-up steps。
 
-下方命令在 /data/benchmarks 写每次 progress/result 以及机器可读 summary.json/summary.csv。它直接调用同一 training.train()，避免把 CLI 多行 JSON 当作 JSONL；每次 train() 仍通过 _device 获取同一个 UUID 锁。先停止模块 4 的 worker，避免与 benchmark 竞争 GPU；任一次失败会以非零退出，不会伪造汇总。100 steps 是可重复的测量 workload，不是质量阈值。
+下方命令在 /data/benchmarks 写每次 progress/result 以及机器可读 summary.json/summary.csv。它直接调用 training.train() 捕获结构化 progress；CLI 的 stderr 文本进度不用于统计。完整事件写入 progress.json，吞吐计算只使用 `phase == "training"` 的 optimizer-step 事件，排除加载、checkpoint 和完成通知。四次调用在同一个 _device UUID 锁内顺序执行。先停止模块 4 的 worker，避免与 benchmark 竞争 GPU；任一次失败会以非零退出。100 steps 是可重复的测量 workload，不是质量阈值。
 
 
 | 输出字段                           | 含义与来源                                                                                |
@@ -476,7 +476,11 @@ def run(name):
  result=train(inputs,root/name/"training",config,progress=progress.append)
  wall=time.monotonic()-start
  atomic_write(root/name/"progress.json",canonical_json(progress))
- b,last=progress[9],progress[-1];seconds=last["elapsed_seconds"]-b["elapsed_seconds"];samples=last["samples_processed_this_run"]-b["samples_processed_this_run"]
+ steps=[event for event in progress if event.get("phase")=="training"]
+ if result["state"]!="COMPLETED" or [event["global_step"] for event in steps]!=list(range(1,config.max_steps+1)):
+  raise RuntimeError("benchmark requires a complete fresh training run with one event per optimizer step")
+ b,last=steps[9],steps[-1];seconds=last["elapsed_seconds"]-b["elapsed_seconds"];samples=last["samples_processed_this_run"]-b["samples_processed_this_run"]
+ if seconds<=0: raise RuntimeError("steady-state measurement interval must be positive")
  return {"run":name,"state":result["state"],"wall_seconds_including_load":wall,"train_elapsed_seconds":result["elapsed_seconds"],"warmup_steps_excluded":10,"steady_steps":last["global_step"]-b["global_step"],"steady_seconds":seconds,"optimizer_step_seconds":seconds/(last["global_step"]-b["global_step"]),"steady_samples":samples,"steady_samples_per_second":samples/seconds,"checkpoint_seconds_total":sum(x.get("checkpoint_seconds",0) for x in progress),"peak_gpu_memory_allocated":peak(progress,"gpu_memory_allocated"),"peak_gpu_memory_reserved":peak(progress,"gpu_memory_reserved"),"peak_cpu_rss_bytes":peak(progress,"cpu_rss_bytes"),"result_path":result["manifest_path"]}
 with _device(config.device):
  from lora_pipeline.training import train

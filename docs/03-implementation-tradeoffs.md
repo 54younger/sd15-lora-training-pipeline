@@ -1,29 +1,34 @@
-# 决策记录——可测试的单主机流水线
+# 实现取舍：可验证的单机交付与生产演进
 
-状态：已接受。本文解释当前实现边界，不声称原始生产设计的所有机制都已构建。
+本记录区分已实现机制和为 Part 1 保留的演进方向；不是把未来架构当成当前能力。源码索引见[系统架构](01-system-architecture.md)与[技术规格](02-technical-specification.md)。
 
-| 决策 | 收益 | 成本与迁移 |
+## 1. 关键取舍
+
+| 决策 | 得到什么 | 明确代价/迁移 |
 |---|---|---|
-| SQLite 代替 PostgreSQL | 无需数据库服务，临时目录即可运行 CPU 集成测试。 | 只有单主机写入串行；没有 `SKIP LOCKED` 或分布式 HA。迁移需要新事务、迁移脚本和并发测试。 |
-| 本地文件代替 S3 | 无 bucket/凭据，checksum 和原子写入容易测试。 | 上传经过 API，文件共享主机故障域；S3 迁移需版本固定、授权和部分写入恢复。 |
-| 一个 supervisor 加设备锁 | 设备所有权清晰，本地进程恢复简单。 | 没有多主机接管；远程调度需 agent、lease、fencing 和可靠终止证据。 |
-| SD 1.5 作为真实模型族 | 适合 16GB 消费 GPU 的训练和推理集成。 | 不声明 SDXL 或多模型族支持；新增 backend 必须实现并测试。 |
-| 保守图像过滤 | 不会误删有意的模糊、低对比度和异常曝光。 | warning 不能保证数据适用；感知分组是启发式，可能过度分组。 |
-| template 或 BLIP caption | 无额外权重即可离线运行；BLIP 可提供内容描述。 | template 不识别主体，BLIP 可能误述；失败不会隐藏。 |
-| 技术成功与质量审批分离 | 合成数据可测试全链路而不伪称风格质量。 | 默认结果为 `UNVERIFIED`，下载需显式同意；`READY` 需要外部校准证据。 |
-| CLIP 诊断，不默认 FID | 小规模作业适合配对图文比较。 | CLIP 混合内容和风格；不宣称阈值能独立验证风格。 |
-| 仅基础设施重试 | 恢复可解释且资源有界。 | OOM 或质量失败需新配置；不自动搜索。 |
-| CPU tiny 测试加本地 GPU smoke | tiny 使用 Diffusers/PEFT 的随机初始化 Autoencoder/UNet/scheduler 图，离线验证真实 LoRA 梯度、冻结参数、resume 和编排。 | 随机权重不验证 CUDA kernel、预训练输出或真实风格质量；真实 SD/BLIP/CLIP 另行运行，tiny 产物永远是 test-only。 |
-| 只定义指标，不虚构基准 | 无 GPU 实测时仍提供可复现实验协议。 | 未运行值保持 `not_measured`。 |
+| SQLite + 本地对象，而非 PostgreSQL + S3 | 无外部服务即可测试短事务、SHA-256、atomic publish、queue/recovery | 只有单主机 durable queue；数据库和对象同故障域。迁移要做 PostgreSQL schema/lease transaction、版本化 object key、scoped auth、部分上传恢复和集成测试。 |
+| 一个 supervisor + UUID OS lock | 每张真实物理 GPU 一 slot，worker 与直接 CLI 共用锁，易验证 stale attempt/取消 | 无多主机 takeover；未来 agent 需要 lease、fencing、PID/termination evidence 和共享状态。 |
+| 多 job 一卡一 stage，而非单 job DDP | 在 2–4 张物理卡上公平承载并发训练/评估，避免 16GB 卡的跨卡通信复杂度 | 单 job 不做 DDP/模型并行；一个 job 的 stage 仍逐步运行，吞吐要靠多 job 和多卡验收。 |
+| batch 1 + accumulation 4 | 降低单卡峰值显存；每 4 个 microstep 才进行一个 optimizer/global step，checkpoint 在 optimizer boundary | wall time 更长，不能把 microstep 数当 optimizer steps；配置和报告分别记录 accumulation/global_step。 |
+| FP16 + gradient checkpointing | 目标是降低 SD15 512px 的 CUDA 激活显存 | checkpointing 用额外计算换显存，FP16 需 scaler/数值监控；实际显存和能否运行必须由 GPU 测量，CPU 强制 FP32。OOM 报错不自动降低分辨率或偷偷改 optimizer。 |
+| 冻结 SD15 基座，只训练 attention LoRA | adapter 小、可独立下载和 inference reload，训练参数/显存较少；rank/alpha 4/4 是当前配置起点 | 表达能力和风格质量需真实数据评估；不支持 SDXL、多 text encoder 或完整基座微调。 |
+| template caption 默认，BLIP 可选 | 缺模型也能离线完成 manifest；BLIP 只在显式 profile 选择时占用资源，并记录 revision | template 只写安全 generic content，不保证主体描述；BLIP 失败显式报错，不 fallback 掩盖问题。CPU template 可释放 GPU 给 TRAIN/EVALUATE。 |
+| CLIP + paired A/B，而非 FID/主观质量假设 | 固定 prompt/seed 的 base-vs-adapter 差值可复现，适合 smoke 和诊断 | CLIP 混合语义/风格，FID 未实现；没有仓库内校准数据和业务 threshold。 |
+| 技术成功与质量 READY 分离 | 能发布并检查 loadable adapter，同时不把 tiny 或未校准结果冒充质量合格 | 默认 policy 为 null，job 是 COMPLETED_UNVERIFIED、model state 是 UNVERIFIED；calibration_reference 仅作 operator 证据标识，代码不读取/核验外部证据真实性。 |
+| 仅基础设施 retry | 恢复 bounded、解释性强，避免 OOM/质量失败无限重训 | 需要换参数或重新质量候选时由 operator 新建 job；没有自动超参搜索。 |
 
-## 保留的可靠性
+## 2. inference-ready 交付边界
 
-实现保留不可变 manifest 链、有界上传、owner 授权、接纳配额、幂等 mutation、持久 task、唯一发布和完整 checkpoint。API 与 worker 是独立进程；新的 supervisor 不把过期 heartbeat 当作旧 GPU 进程已停止的证据。`COMPLETED_UNVERIFIED` 是技术成功，`READY` 仍是质量审批结果；test-only 结果始终保留标记。
+发布的可推理 artifact 不是一个裸 checkpoint：至少绑定 adapter.safetensors、其 SHA-256、base model 名称与 immutable revision/fingerprint、训练 input manifest digest、trigger token、inference/evaluation config，以及带 technical outcome/quality status 的 evaluation report。这些 metadata 分布在 training-input、training-result、evaluation report 和 model registry；download endpoint 本身只返回 adapter bytes。PUBLISH 逐项检查 adapter、manifest、report、input binding 和 checksum；model record 每 job 唯一。使用者可用该 adapter 加载兼容 SD15 基座并复现 trigger/inference 配置，但默认结果未质量认证，下载 UNVERIFIED 需要显式同意。在线 inference serving、autoscaling、TLS ingress、模型路由和实时请求 API 未实现。
 
-## 不是生产保证
+## 3. 可靠性保留与明确缺口
 
-没有多主机故障转移、敌意代码沙箱、内容审核、校准风格评估器、磁盘故障零数据丢失或自动保留清理。API 不接收自定义 Python 或任意 checkpoint。公开服务还需要 TLS、限流和身份提供商。一个物理 GPU 不能被虚构为四个 CUDA slot；fake slots 只测试 admission/fairness。
+保留下来的生产性质是 owner 隔离、大小/摘要限制、必要 mutation 幂等、冻结 manifest 链、attempt fencing、heartbeat/lease、GPU 资源公平、取消、唯一 publication、完整 resume 和结构化错误/metrics。资源调度是 weighted EVALUATE → TRAIN → CAPTION → TRAIN， 并在 owner 间 round-robin；它是多 job 的逻辑公平，不是 DDP。
 
-## 参考来源
+仍不保证多主机故障转移、磁盘损坏零丢失、恶意代码 sandbox、内容审核、外部校准器、自动 retention/backup 或在线 serving。2–4 张 GPU、SD15/BLIP/CLIP 质量和 benchmark 必须在目标硬件实际运行；CPU tiny 和 fake slots 只能覆盖离线逻辑。所有未运行数字写 not_measured。
 
-SQLite 的单写入和同主机约束：[SQLite 文档](https://sqlite.org/wal.html)。Diffusers 的 attention LoRA 和 adapter 保存：[Diffusers LoRA guide](https://huggingface.co/docs/diffusers/training/lora)。Accelerate 对 optimizer、RNG、scaler 和 data-loader checkpoint 的说明：[checkpoint guide](https://huggingface.co/docs/accelerate/usage_guides/checkpoint)。
+## 4. 证据与外部参考
+
+实现证据包括 [config.py](../src/lora_pipeline/config.py) 的 batch/accumulation/precision/checkpoint 配置，[training.py](../src/lora_pipeline/training.py) 的冻结参数、resume 和进度，[store.py](../src/lora_pipeline/store.py) 的 GPU slot/fairness/attempt，[evaluation.py](../src/lora_pipeline/evaluation.py) 的 policy 方向，以及 [tests/test_training.py](../tests/test_training.py)、[tests/test_scheduler_recovery.py](../tests/test_scheduler_recovery.py) 和 [tests/test_evaluation.py](../tests/test_evaluation.py)。
+
+有关 single-writer 与 WAL 的边界，见 [SQLite 文档](https://sqlite.org/wal.html)；本项目选择默认 rollback journal，不把网络文件系统当 HA 数据库。有关 attention LoRA 与 adapter saving，见 [Diffusers LoRA guide](https://huggingface.co/docs/diffusers/training/lora)；有关 optimizer/RNG/scaler checkpointing，见 [Accelerate checkpoint guide](https://huggingface.co/docs/accelerate/usage_guides/checkpoint)。
