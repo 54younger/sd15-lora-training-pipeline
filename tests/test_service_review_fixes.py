@@ -78,6 +78,55 @@ def test_stage_child_does_not_execute_when_registration_is_fenced(monkeypatch):
     assert calls["execute"] == 0
 
 
+def test_unexpected_worker_error_is_safe_and_logs_traceback_locations(monkeypatch):
+    failures, events = [], []
+
+    class FakeStore:
+        def task_context(self, _task):
+            return {}
+
+        def fail_task(self, *_args, **_kwargs):
+            failures.append(_args[2])
+            return True
+
+    def failing_stage(*_args):
+        raise RuntimeError("Authorization: Bearer secret-value")
+
+    worker = worker_module.Worker.__new__(worker_module.Worker)
+    worker.store = FakeStore()
+    worker._stage = failing_stage
+    monkeypatch.setattr(worker_module, "log_event", lambda event, **fields: events.append((event, fields)))
+
+    worker._execute({"attempt_id": "attempt", "token": 1, "job_id": "job", "id": "task", "stage": "TRAIN"})
+
+    assert len(failures) == 1
+    error = failures[0]
+    assert error.code == "WORKER_EXCEPTION"
+    assert error.message == "Unexpected RuntimeError while executing TRAIN. Check worker logs for traceback locations."
+    assert "secret-value" not in error.message
+    assert error.details == {"exception_type": "RuntimeError"}
+    assert len(events) == 1
+    event, fields = events[0]
+    assert event == "stage_failed"
+    assert {
+        key: fields[key]
+        for key in ("job_id", "task_id", "attempt_id", "stage", "code", "retryable", "exception_type")
+    } == {
+        "job_id": "job",
+        "task_id": "task",
+        "attempt_id": "attempt",
+        "stage": "TRAIN",
+        "code": "WORKER_EXCEPTION",
+        "retryable": True,
+        "exception_type": "RuntimeError",
+    }
+    assert fields["traceback_locations"][-1] == {
+        "file": "test_service_review_fixes.py",
+        "line": failing_stage.__code__.co_firstlineno + 1,
+        "function": "failing_stage",
+    }
+
+
 def test_mixed_caption_resources_respect_cpu_capacity(tmp_path):
     store = make_store(tmp_path, cpu_slots=1)
     cpu_job, gpu_job = make_job(store, "cpu", "CAPTION"), make_job(store, "gpu", "CAPTION")
@@ -104,6 +153,52 @@ def test_cancelled_stage_failure_cannot_overwrite_cancellation(tmp_path):
         retry=True,
     )
     assert store.job("owner", job_id)["state"] == "CANCELLED"
+
+
+def test_failure_details_are_persisted_per_attempt_and_final_job_uses_latest_failure(tmp_path):
+    store = make_store(tmp_path)
+    job_id = make_job(store)
+    first = store.claim_task(["cpu-test-0"])
+    assert first
+    first_details = {"exception_type": "RuntimeError", "phase": "sd15_unet_loading"}
+    assert store.fail_task(
+        first["attempt_id"],
+        first["token"],
+        PipelineError("WORKER_EXCEPTION", "safe first failure", retryable=True, details=first_details),
+        retry=True,
+    )
+    # A retry keeps the job runnable and does not make an earlier failure the
+    # job-level terminal error, while retaining its own attempt diagnostics.
+    assert store.job("owner", job_id)["error_details"] is None
+    with store.reader() as connection:
+        persisted = connection.execute(
+            "SELECT error_details_json FROM task_attempts WHERE id=?", (first["attempt_id"],)
+        ).fetchone()[0]
+    assert json.loads(persisted) == first_details
+
+    with store.transaction() as connection:
+        connection.execute("UPDATE stage_tasks SET ready_at=0 WHERE id=?", (first["id"],))
+    second = store.claim_task(["cpu-test-0"])
+    assert second and second["attempt_id"] != first["attempt_id"]
+    latest_details = {"exception_type": "ValueError", "phase": "optimizer_initializing"}
+    assert store.fail_task(
+        second["attempt_id"],
+        second["token"],
+        PipelineError("OPTIMIZER_SETUP_FAILED", "safe final failure", details=latest_details),
+    )
+
+    job = store.job("owner", job_id)
+    assert (job["state"], job["error_code"], job["error_message"], job["error_details"]) == (
+        "FAILED",
+        "OPTIMIZER_SETUP_FAILED",
+        "safe final failure",
+        latest_details,
+    )
+    with store.reader() as connection:
+        attempts = connection.execute(
+            "SELECT error_details_json FROM task_attempts WHERE task_id=? ORDER BY attempt_no", (first["id"],)
+        ).fetchall()
+    assert [json.loads(row[0]) for row in attempts] == [first_details, latest_details]
 
 
 def test_frozen_stage_limit_and_remaining_gpu_budget_drive_deadline(tmp_path):

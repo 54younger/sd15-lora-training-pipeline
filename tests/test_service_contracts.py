@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import hashlib
+import json
 import uuid
 from pathlib import Path
 
@@ -11,7 +12,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from lora_pipeline.api import create_app
-from lora_pipeline.common import write_manifest
+from lora_pipeline.common import PipelineError, write_manifest
 from lora_pipeline.config import DataConfig, Settings
 
 
@@ -159,6 +160,71 @@ def test_tenant_lookups_are_masked_as_not_found(client: TestClient):
     response = client.get(f"/v1/datasets/{dataset['id']}", headers=BOB)
     assert response.status_code == 404
     assert response.json()["error"]["code"] == "NOT_FOUND"
+
+
+def test_job_api_exposes_persisted_safe_failure_details(client: TestClient, app):
+    dataset_id = _verified_dataset(client, app)
+    created = client.post(
+        "/v1/training-jobs",
+        headers={**ALICE, "Idempotency-Key": "job-failure-details"},
+        json={"dataset_id": dataset_id, "profile_revision_id": "local-tiny-v1", "trigger_token": "style"},
+    )
+    assert created.status_code == 202, created.text
+    job_id = created.json()["job_id"]
+    task = app.state.store.claim_task([])
+    assert task and task["job_id"] == job_id
+    details = {"exception_type": "RuntimeError", "phase": "sd15_unet_loading"}
+    assert app.state.store.fail_task(
+        task["attempt_id"],
+        task["token"],
+        PipelineError("WORKER_EXCEPTION", "Unexpected RuntimeError while executing PREPARE.", details=details),
+    )
+
+    response = client.get(f"/v1/training-jobs/{job_id}", headers=ALICE)
+    assert response.status_code == 200
+    body = response.json()
+    assert body["error_code"] == "WORKER_EXCEPTION"
+    assert body["error_details"] == details
+
+
+def test_browser_lists_manual_advance_idempotency_and_artifact_boundary(client: TestClient, app, tmp_path: Path):
+    dataset_id = _verified_dataset(client, app)
+    assert client.get("/v1/datasets?limit=1&offset=0", headers=ALICE).json()["total"] == 1
+    dataset = client.get(f"/v1/datasets/{dataset_id}?include_files=true", headers=ALICE)
+    assert dataset.status_code == 200 and len(dataset.json()["files"]) == 1
+    created = client.post(
+        "/v1/training-jobs",
+        headers={**ALICE, "Idempotency-Key": "manual-create"},
+        json={"dataset_id": dataset_id, "profile_revision_id": "local-tiny-v1", "trigger_token": "style", "execution_mode": "manual"},
+    )
+    assert created.status_code == 202, created.text
+    job_id = created.json()["job_id"]
+    with app.state.store.transaction() as connection:
+        connection.execute("UPDATE jobs SET state='WAITING_FOR_USER',waiting_for_stage='TRAIN' WHERE id=?", (job_id,))
+    body = {"stage": "TRAIN", "training_overrides": {"max_steps": 2}}
+    first = client.post(f"/v1/training-jobs/{job_id}/advance", headers={**ALICE, "Idempotency-Key": "advance"}, json=body)
+    assert first.status_code == 202, first.text
+    assert client.post(f"/v1/training-jobs/{job_id}/advance", headers={**ALICE, "Idempotency-Key": "advance"}, json=body).status_code == 202
+    mismatch = client.post(f"/v1/training-jobs/{job_id}/advance", headers={**ALICE, "Idempotency-Key": "advance"}, json={"stage": "TRAIN", "training_overrides": {"max_steps": 3}})
+    assert mismatch.status_code == 409
+    assert client.post(f"/v1/training-jobs/{job_id}/advance", headers={**BOB, "Idempotency-Key": "other"}, json=body).status_code == 404
+    jobs = client.get("/v1/training-jobs?state=ACCEPTED", headers=ALICE).json()
+    assert jobs["total"] == 1 and jobs["items"][0]["id"] == job_id
+
+    artifact_root = Path(app.state.store.artifacts) / job_id / "attempt"
+    manifest = write_manifest(artifact_root / "prepared.json", {"kind": "prepared"})
+    with app.state.store.transaction() as connection:
+        connection.execute("UPDATE jobs SET prepared_json=? WHERE id=?", (json.dumps(manifest), job_id))
+    artifacts = client.get(f"/v1/training-jobs/{job_id}/artifacts", headers=ALICE).json()["artifacts"]
+    assert client.get(artifacts[0]["url"], headers=ALICE).status_code == 200
+    outside = tmp_path / "outside.json"
+    outside.write_text("outside")
+    linked = artifact_root / "linked.json"
+    linked.symlink_to(outside)
+    with app.state.store.transaction() as connection:
+        connection.execute("UPDATE jobs SET prepared_json=? WHERE id=?", (json.dumps({"manifest_path": str(linked)}), job_id))
+    rejected = client.get(f"/v1/training-jobs/{job_id}/artifacts/prepared_manifest-0", headers=ALICE)
+    assert rejected.status_code == 404
 
 
 def test_concurrent_same_idempotency_key_creates_exactly_one_dataset(app):

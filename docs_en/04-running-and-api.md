@@ -1,6 +1,8 @@
 # Running, acceptance, and API guide
 
-This document indexes the implemented boundary and acceptance evidence. The complete GPU Docker runbook (IBean preparation, `dc run` heredocs, real training, evaluation, and benchmark commands) is in Part 2 of [README.md](../README.md). Keeping the long procedure there avoids two copies drifting. Full submission navigation is in [00-assignment-guide.md](00-assignment-guide.md).
+For the manual four-step browser workflow, see the [Web Studio deployment and operation guide](06-web-studio.md). The CLI/API automatic workflow and GPU acceptance guidance remain below.
+
+This document indexes the implemented boundary and acceptance evidence. The complete GPU Docker runbook (IBean preparation, `dc run` heredocs, real training, evaluation, and benchmark commands) is the [Docker CLI training and GPU acceptance guide](07-docker-cli-training.md). Full submission navigation is in [00-assignment-guide.md](00-assignment-guide.md).
 
 ## Keep the three kinds of evidence separate
 
@@ -8,7 +10,7 @@ This document indexes the implemented boundary and acceptance evidence. The comp
 - **10-step GPU smoke** is target-NVIDIA-host functional acceptance: real SD 1.5, interruption at step 5, resume, adapter reload, and a small evaluation. It is not a capacity benchmark or a quality threshold.
 - **100-step GPU performance** is a fixed-real-input, pinned-base measurement requiring one warm-up and at least three complete runs. It is separate from quality evaluation. Quality evidence comes only from paired base/adapter evaluation under fixed prompts/seeds and a calibrated policy.
 
-The recommended real acceptance data is the local IBean copy: 999 images (333 per class) under `datasets/ibean/images/` plus `captions.json`. It is neither synthetic nor a calibrated style-quality set. Use the IBean section in [README.md](../README.md) for download, license, SHA-256, and selection details.
+The recommended real acceptance data is the local IBean copy: 999 images (333 per class) under `datasets/ibean/images/` plus `captions.json`. It is neither synthetic nor a calibrated style-quality set. Use the [IBean section of the Docker CLI guide](07-docker-cli-training.md#ibean-999-acceptance-dataset) for download, license, SHA-256, and selection details.
 
 ## Install and CPU regression
 
@@ -64,11 +66,11 @@ dc run --rm --no-deps worker lora-pipeline preflight
 
 If the Docker socket requires elevated access, change the function body to `sudo docker compose ...`; do not run `sudo dc ...`, because sudo does not resolve the current shell function. In PowerShell use `function dc { docker compose -f compose.yaml -f compose.gpu.yaml @args }`. Stop if `preflight` does not show the expected `cuda_available`, allowed GPU UUIDs, and memory.
 
-The README modules 1–4 are the canonical GPU runbook. Their heredoc container commands use `-i -T`: `-i` supplies script stdin and `-T` disables pseudo-TTY allocation for SSH/CI/redirection. Omitting `-T` causes `the input device is not a TTY`; do not hand-create missing manifests. `/data` is a container path backed by the Compose named volume, **not host `/data`**. Files survive a `--rm` one-shot container in `pipeline-data`; export them with `dc run ... cat` or `dc cp`.
+The Docker CLI guide's modules 1–4 are the canonical GPU runbook. Their heredoc container commands use `-i -T`: `-i` supplies script stdin and `-T` disables pseudo-TTY allocation for SSH/CI/redirection. Omitting `-T` causes `the input device is not a TTY`; do not hand-create missing manifests. `/data` is a container path backed by the Compose named volume, **not host `/data`**. Files survive a `--rm` one-shot container in `pipeline-data`; export them with `dc run ... cat` or `dc cp`.
 
 ### Model cache, training, and progress
 
-Warm `model-cache` online once, resolve the immutable commit, and write `/data/sd15-smoke-pinned.json`. Training and resume then use that pinned configuration with `local_files_only=true`; download time is excluded from performance measurement. See the [README](../README.md) Training module.
+Warm `model-cache` online once, resolve the immutable commit, and write `/data/sd15-smoke-pinned.json`. Training and resume then use that pinned configuration with `local_files_only=true`; download time is excluded from performance measurement. See the [Docker CLI guide's training module](07-docker-cli-training.md#2-pin-the-base-model-then-train-and-resume).
 
 Classify base-model download failures as `BASE_MODEL_UNAVAILABLE`, not `CHECKPOINT_CORRUPT`, `CHECKPOINT_INCOMPATIBLE`, or OOM. The error details expose only a redacted model/revision, cache/offline state, and controlled category; they do not promise the raw root cause. Fix network, credentials, cache, or disk before the offline check. If a frozen input checksum differs, preserve path/expected/actual details, rebuild, and rerun prepare+caption to create a new manifest; never edit the old manifest or bypass verification. Normalized images are addressed by SHA-256 of final PNG bytes, so a new encoder cannot overwrite files referenced by an old frozen manifest.
 

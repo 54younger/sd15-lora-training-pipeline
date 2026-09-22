@@ -9,7 +9,14 @@ from safetensors.torch import load_file
 from lora_pipeline.common import sha256_file, write_manifest
 from lora_pipeline.common import PipelineError
 from lora_pipeline.config import TrainConfig
-from lora_pipeline.training import _base_identity, _load_sd15, _resolve_sd15_base, train, validate_input_integrity
+from lora_pipeline.training import (
+    _base_identity,
+    _cuda_peak_memory_stats,
+    _load_sd15,
+    _resolve_sd15_base,
+    train,
+    validate_input_integrity,
+)
 
 
 def _manifest(tmp_path: Path) -> dict:
@@ -86,6 +93,9 @@ def test_training_progress_has_lifecycle_and_step_schema(tmp_path: Path):
     phases = [update["phase"] for update in updates]
     assert phases[0] == "training_started"
     assert "model_loading" in phases
+    assert "tiny_components_loading" in phases
+    assert "optimizer_initializing" in phases
+    assert "optimizer_initialized" in phases
     assert "checkpoint_saving" in phases
     assert phases[-1] == "training_completed"
     step_updates = [update for update in updates if update["phase"] == "training"]
@@ -263,8 +273,9 @@ def test_component_load_error_includes_resolved_snapshot_details(tmp_path: Path,
         raise OSError("token=hf_componentsecret model files are missing")
 
     monkeypatch.setattr(transformers.CLIPTokenizer, "from_pretrained", unavailable)
+    updates: list[dict] = []
     with pytest.raises(PipelineError) as error:
-        _load_sd15(config, device=object())
+        _load_sd15(config, device=object(), progress=updates.append)
 
     assert error.value.code == "BASE_MODEL_UNAVAILABLE"
     assert error.value.retryable is True
@@ -277,6 +288,109 @@ def test_component_load_error_includes_resolved_snapshot_details(tmp_path: Path,
         "resolved_revision": "a1b2c3d4",
         "reason": "OSError: io",
     }
+    assert [update["phase"] for update in updates] == [
+        "sd15_snapshot_resolving",
+        "sd15_snapshot_resolved",
+        "sd15_tokenizer_loading",
+    ]
+
+
+def test_cuda_cleanup_failure_never_masks_model_loading_pipeline_error(tmp_path: Path, monkeypatch, caplog):
+    class FakeCuda:
+        @staticmethod
+        def is_available():
+            return True
+
+        @staticmethod
+        def empty_cache():
+            raise OSError("driver teardown failed")
+
+        @staticmethod
+        def manual_seed_all(_seed):
+            return None
+
+    class FakeTorch:
+        cuda = FakeCuda()
+
+        @staticmethod
+        def device(_name):
+            return type("Device", (), {"type": "cpu"})()
+
+        @staticmethod
+        def manual_seed(_seed):
+            return None
+
+    original_error = PipelineError("BASE_MODEL_UNAVAILABLE", "Pinned model is unavailable")
+    monkeypatch.setattr("lora_pipeline.training._torch", lambda: (FakeTorch(), None, None))
+    monkeypatch.setattr(
+        "lora_pipeline.training._tiny_model", lambda *_args: (_ for _ in ()).throw(original_error)
+    )
+
+    with pytest.raises(PipelineError) as error:
+        train(_manifest(tmp_path), tmp_path / "run", _config(max_steps=1))
+
+    assert error.value is original_error
+    assert "CUDA cache cleanup failed (exception_type=OSError)" in caplog.text
+
+
+def test_cuda_memory_telemetry_initialization_error_does_not_stop_training_setup(tmp_path: Path, monkeypatch, caplog):
+    class FakeCuda:
+        @staticmethod
+        def is_available():
+            return True
+
+        @staticmethod
+        def manual_seed_all(_seed):
+            return None
+
+        @staticmethod
+        def reset_peak_memory_stats(_device):
+            raise RuntimeError("Invalid device argument")
+
+    class FakeTorch:
+        cuda = FakeCuda()
+
+        @staticmethod
+        def device(_name):
+            return type("Device", (), {"type": "cuda"})()
+
+        @staticmethod
+        def manual_seed(_seed):
+            return None
+
+    updates: list[dict] = []
+    expected_error = PipelineError("MODEL_LOADING_SENTINEL", "model loading was reached")
+    monkeypatch.setattr("lora_pipeline.training._torch", lambda: (FakeTorch(), None, None))
+    monkeypatch.setattr(
+        "lora_pipeline.training._tiny_model", lambda *_args: (_ for _ in ()).throw(expected_error)
+    )
+
+    with pytest.raises(PipelineError) as error:
+        train(_manifest(tmp_path), tmp_path / "run", _config(device="cuda:0", max_steps=1), progress=updates.append)
+
+    assert error.value is expected_error
+    phases = [update["phase"] for update in updates]
+    assert phases.index("cuda_memory_initializing") < phases.index("cuda_memory_telemetry_unavailable")
+    assert phases.index("cuda_memory_telemetry_unavailable") < phases.index("model_loading")
+    telemetry_update = updates[phases.index("cuda_memory_telemetry_unavailable")]
+    assert telemetry_update["gpu_memory_telemetry_available"] is False
+    assert "CUDA memory telemetry initialization failed (exception_type=RuntimeError)" in caplog.text
+
+
+def test_cuda_peak_memory_stats_failure_is_best_effort(caplog):
+    class FakeCuda:
+        @staticmethod
+        def max_memory_allocated(_device):
+            raise RuntimeError("Invalid device argument")
+
+        @staticmethod
+        def max_memory_reserved(_device):
+            raise AssertionError("second telemetry call must not run")
+
+    stats = _cuda_peak_memory_stats(type("FakeTorch", (), {"cuda": FakeCuda()})(), object())
+
+    assert stats is None
+    assert "CUDA memory telemetry collection failed (exception_type=RuntimeError)" in caplog.text
 
 
 @pytest.mark.parametrize(

@@ -4,8 +4,11 @@ This document describes contracts present in the source, not the README's aspira
 
 ## 1. Components, persistence and artifact lineage
 
+See the [Web Studio guide](06-web-studio.md) for browser operation and new endpoints. Default `execution_mode=auto` preserves the automatic orchestration below. Manual jobs enter `WAITING_FOR_USER` after input preparation, training and evaluation; an idempotent `advance` starts `waiting_for_stage`. The base profile remains immutable; manual training/evaluation overrides freeze separately when their stage is first enqueued.
+
 | Component | Current responsibility | Evidence |
 |---|---|---|
+| Web | English four-step workflow, caption editing, bounded uploads, parameter forms, status/history, artifact previews/downloads and same-origin Nginx proxy | [frontend](../frontend/) |
 | API | Bearer owner auth, bounded streaming uploads, request validation, required mutation idempotency, status/cancel/download, health and admin metrics | [api.py](../src/lora_pipeline/api.py) |
 | Store | SQLite schema/short transactions, quotas, queue, attempts/leases/fencing, owner isolation, unique model | [store.py](../src/lora_pipeline/store.py) |
 | Worker | Singleton supervisor, dataset VERIFY, stage children, heartbeat/watchdog, cancellation, recovery and resource dispatch | [worker.py](../src/lora_pipeline/worker.py) |

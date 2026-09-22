@@ -1,5 +1,18 @@
 # 交付验证记录 / Validation record
 
+## Web Studio 增量验证 / 2026-09-22
+
+本次新增英文浏览器工作台、手动阶段确认 API、产物接口及 `web` Compose 服务。以下记录独立于下方历史结果：
+
+- Python 最终全量回归：107 passed in 37.42s，1 条 Starlette/AnyIO 弃用警告；包含自动及手动 HTTP → 独立 worker → 下载流程。
+- 随后补充的手动工作流/安全边界测试：21 passed，覆盖旧数据库迁移、确认等待、阶段覆盖参数、owner 分页、路径/符号链接防护和质量拒绝。
+- Ruff、当前 Mypy 范围及 CPU/GPU 两套 Compose 配置解析通过。
+- 前端 TypeScript 与 Vite 生产构建通过，API 客户端 8 项单元测试通过。
+- Chromium + 实际 FastAPI/独立 CPU worker：完整四步操作、100 张图片及 caption 编辑、三个确认等待点、刷新恢复、图片分页、多份 manifest/评估报告下载、未验证 adapter 下载确认、owner 隔离和移动端退出通过；故意中断上传后刷新并重新选图，恢复上传且不重复创建数据集通过。另一个浏览器测试提供 INVALID 响应验证表单解锁。最终 3 passed in 24.8s，不作为模型训练性能指标。
+- 独立后端/前端代码审查完成，确认状态机、冻结参数、路径隔离和 Blob 生命周期；重要发现均已修复。截图位于忽略跟踪的 `frontend/test-results/`。
+- Docker daemon：普通用户无 socket 访问权限，`sudo -n` 要求密码，未执行容器构建/启动；Compose 解析不等于容器运行验证。
+- 当前 PyTorch 为 CPU 构建，真实 GPU/SD 1.5 测试仍未执行，不据此声称 GPU 性能或生成质量通过。
+
 验证日期：2026-09-21。所有测试使用临时生成的图像，不依赖用户数据集。
 
 ## 已验证 / Verified

@@ -12,6 +12,7 @@ import gc
 import hashlib
 import importlib.metadata
 import json
+import logging
 import os
 import random
 import re
@@ -28,6 +29,94 @@ from .config import TrainConfig
 
 Progress = Callable[[dict], None]
 _CODE_VERSION = "training-v1"
+
+
+def _loading_progress(progress: Progress | None, phase: str, config: TrainConfig) -> None:
+    """Report a bounded setup phase without inventing numerical progress."""
+    if progress:
+        progress({"phase": phase, "current": 0, "total": config.max_steps})
+
+
+def _safe_cuda_empty_cache(torch) -> None:
+    """Best-effort CUDA cleanup must not replace the error that caused it.
+
+    CUDA teardown can itself fail after a driver/device failure. A cleanup error
+    is useful operationally, but must never turn a classified training failure
+    into a generic worker exception.
+    """
+    try:
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception as exc:  # cleanup is never allowed to mask the primary error
+        logging.getLogger("lora_pipeline").warning(
+            "CUDA cache cleanup failed (exception_type=%s)", type(exc).__name__
+        )
+
+
+def _safe_training_cleanup(torch, model) -> None:
+    """Release transient training state without allowing teardown to raise."""
+    if model is not None:
+        try:
+            del model
+        except Exception as exc:  # pragma: no cover - defensive for third-party model objects
+            logging.getLogger("lora_pipeline").warning(
+                "Model cleanup failed (exception_type=%s)", type(exc).__name__
+            )
+    try:
+        gc.collect()
+    except Exception as exc:  # pragma: no cover - gc failures are platform-specific
+        logging.getLogger("lora_pipeline").warning(
+            "Garbage collection cleanup failed (exception_type=%s)", type(exc).__name__
+        )
+    _safe_cuda_empty_cache(torch)
+
+
+def _reset_cuda_memory_stats(torch, device) -> bool:
+    """Initialize optional CUDA accounting without making telemetry a training dependency."""
+    try:
+        torch.cuda.reset_peak_memory_stats(device)
+    except Exception as exc:
+        logging.getLogger("lora_pipeline").warning(
+            "CUDA memory telemetry initialization failed (exception_type=%s)", type(exc).__name__
+        )
+        return False
+    return True
+
+
+def _cuda_peak_memory_stats(torch, device) -> dict[str, int] | None:
+    """Return optional CUDA peak-memory statistics without interrupting training.
+
+    These counters are observability only.  Some drivers reject the accounting
+    calls despite successfully running ordinary CUDA operations on the same
+    device, so a failure here must not be treated as a device failure.
+    """
+    try:
+        return {
+            "gpu_memory_allocated": int(torch.cuda.max_memory_allocated(device)),
+            "gpu_memory_reserved": int(torch.cuda.max_memory_reserved(device)),
+        }
+    except Exception as exc:
+        logging.getLogger("lora_pipeline").warning(
+            "CUDA memory telemetry collection failed (exception_type=%s)", type(exc).__name__
+        )
+        return None
+
+
+def _memory_telemetry_unavailable_progress(
+    progress: Progress | None, config: TrainConfig, exception_type: str | None = None
+) -> None:
+    """Tell clients that training continues without optional GPU-memory metrics."""
+    if not progress:
+        return
+    payload: dict[str, int | str | bool] = {
+        "phase": "cuda_memory_telemetry_unavailable",
+        "current": 0,
+        "total": config.max_steps,
+        "gpu_memory_telemetry_available": False,
+    }
+    if exception_type:
+        payload["telemetry_exception_type"] = exception_type
+    progress(payload)
 
 
 def _torch():
@@ -427,7 +516,7 @@ def _resolve_sd15_base(config: TrainConfig) -> tuple[Path, str, str]:
     return root, revision, _base_identity(root)
 
 
-def _load_sd15(config: TrainConfig, device):
+def _load_sd15(config: TrainConfig, device, progress: Progress | None = None):
     try:
         from diffusers import AutoencoderKL, DDPMScheduler, UNet2DConditionModel
         from peft import LoraConfig
@@ -436,13 +525,20 @@ def _load_sd15(config: TrainConfig, device):
         raise PipelineError(
             "DEPENDENCY_MISSING", "SD 1.5 training needs diffusers, peft and transformers"
         ) from exc
+    _loading_progress(progress, "sd15_snapshot_resolving", config)
     root, resolved_revision, fingerprint = _resolve_sd15_base(config)
+    _loading_progress(progress, "sd15_snapshot_resolved", config)
     kwargs = {"local_files_only": True}
     try:
+        _loading_progress(progress, "sd15_tokenizer_loading", config)
         tokenizer = CLIPTokenizer.from_pretrained(root, subfolder="tokenizer", **kwargs)
+        _loading_progress(progress, "sd15_text_encoder_loading", config)
         text_encoder = CLIPTextModel.from_pretrained(root, subfolder="text_encoder", **kwargs).to(device)
+        _loading_progress(progress, "sd15_vae_loading", config)
         vae = AutoencoderKL.from_pretrained(root, subfolder="vae", **kwargs).to(device)
+        _loading_progress(progress, "sd15_unet_loading", config)
         unet = UNet2DConditionModel.from_pretrained(root, subfolder="unet", **kwargs).to(device)
+        _loading_progress(progress, "sd15_scheduler_loading", config)
         scheduler = DDPMScheduler.from_pretrained(root, subfolder="scheduler", **kwargs)
     except PipelineError:
         raise
@@ -463,17 +559,24 @@ def _load_sd15(config: TrainConfig, device):
     unet.requires_grad_(False)
     if config.gradient_checkpointing:
         unet.enable_gradient_checkpointing()
-    unet.add_adapter(
-        LoraConfig(
-            r=config.rank,
-            lora_alpha=config.lora_alpha,
-            target_modules=["to_q", "to_k", "to_v", "to_out.0"],
-            bias="none",
+    _loading_progress(progress, "sd15_adapter_setup", config)
+    try:
+        unet.add_adapter(
+            LoraConfig(
+                r=config.rank,
+                lora_alpha=config.lora_alpha,
+                target_modules=["to_q", "to_k", "to_v", "to_out.0"],
+                bias="none",
+            )
         )
-    )
+    except PipelineError:
+        raise
+    except Exception as exc:
+        raise PipelineError("LORA_SETUP_FAILED", "Could not configure SD 1.5 LoRA adapters") from exc
     trainable = [p for p in unet.parameters() if p.requires_grad]
     if not trainable:
         raise PipelineError("LORA_SETUP_FAILED", "No UNet LoRA parameters were enabled")
+    _loading_progress(progress, "sd15_adapter_ready", config)
     return {
         "unet": unet,
         "vae": vae,
@@ -692,27 +795,44 @@ def train(
     if progress:
         progress({"phase": "input_validation", "current": 0, "total": config.max_steps})
     validate_input_integrity(input_manifest)
+    _loading_progress(progress, "device_resolving", config)
     device = _safe_device(config)
+    _loading_progress(progress, "device_resolved", config)
     if stop_after_step is not None and not 1 <= stop_after_step <= config.max_steps:
         raise PipelineError("INVALID_STOP_STEP", "stop_after_step must be within max_steps")
+    _loading_progress(progress, "random_seed_initializing", config)
     _seed_everything(config.seed)
+    _loading_progress(progress, "random_seed_initialized", config)
     compatibility_key = _compatibility_key(input_manifest, config)
     start_time = time.monotonic()
+    cuda_memory_telemetry_available = False
     if device.type == "cuda":
-        torch.cuda.reset_peak_memory_stats(device)
+        _loading_progress(progress, "cuda_memory_initializing", config)
+        cuda_memory_telemetry_available = _reset_cuda_memory_stats(torch, device)
+        if cuda_memory_telemetry_available:
+            _loading_progress(progress, "cuda_memory_initialized", config)
+        else:
+            _memory_telemetry_unavailable_progress(progress, config)
     model = None
     try:
-        if progress:
-            progress({"phase": "model_loading", "current": 0, "total": config.max_steps})
-        components = _tiny_model(config, device) if config.backend == "tiny" else _load_sd15(config, device)
+        _loading_progress(progress, "model_loading", config)
+        if config.backend == "tiny":
+            _loading_progress(progress, "tiny_components_loading", config)
+            components = _tiny_model(config, device)
+        else:
+            components = _load_sd15(config, device, progress=progress)
         model, trainable = components["unet"], components["trainable"]
-        if progress:
-            progress({"phase": "model_loaded", "current": 0, "total": config.max_steps})
-        optimizer = torch.optim.AdamW(trainable, lr=config.learning_rate)
-        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda _: 1.0)
-        scaler = torch.amp.GradScaler(
-            device.type, enabled=device.type == "cuda" and config.precision == "fp16"
-        )
+        _loading_progress(progress, "model_loaded", config)
+        _loading_progress(progress, "optimizer_initializing", config)
+        try:
+            optimizer = torch.optim.AdamW(trainable, lr=config.learning_rate)
+            scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda _: 1.0)
+            scaler = torch.amp.GradScaler(
+                device.type, enabled=device.type == "cuda" and config.precision == "fp16"
+            )
+        except Exception as exc:
+            raise PipelineError("OPTIMIZER_SETUP_FAILED", "Could not initialize the training optimizer") from exc
+        _loading_progress(progress, "optimizer_initialized", config)
         if resume_from:
             if progress:
                 progress({"phase": "checkpoint_restoring", "current": 0, "total": config.max_steps})
@@ -874,9 +994,15 @@ def train(
             rss = _rss_bytes()
             if rss is not None:
                 payload["cpu_rss_bytes"] = rss
-            if device.type == "cuda":
-                payload["gpu_memory_allocated"] = int(torch.cuda.max_memory_allocated(device))
-                payload["gpu_memory_reserved"] = int(torch.cuda.max_memory_reserved(device))
+            if device.type == "cuda" and cuda_memory_telemetry_available:
+                memory_stats = _cuda_peak_memory_stats(torch, device)
+                if memory_stats is None:
+                    cuda_memory_telemetry_available = False
+                    _memory_telemetry_unavailable_progress(progress, config)
+                    payload["gpu_memory_telemetry_available"] = False
+                else:
+                    payload.update(memory_stats)
+                    payload["gpu_memory_telemetry_available"] = True
             if progress:
                 progress(payload)
             if global_step == stop_after_step:
@@ -943,15 +1069,10 @@ def train(
         return result
     except RuntimeError as exc:
         if "out of memory" in str(exc).lower():
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+            _safe_cuda_empty_cache(torch)
             raise PipelineError(
                 "GPU_OUT_OF_MEMORY", "Training ran out of GPU memory", retryable=False
             ) from exc
         raise
     finally:
-        if model is not None:
-            del model
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        _safe_training_cleanup(torch, model)

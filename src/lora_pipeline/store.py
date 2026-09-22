@@ -183,7 +183,7 @@ class Store:
                   state TEXT NOT NULL, current_stage TEXT, candidate_index INTEGER NOT NULL DEFAULT 0,
                   trigger_token TEXT NOT NULL, profile_json TEXT NOT NULL, training_overrides_json TEXT NOT NULL,
                   prepared_json TEXT, input_json TEXT, training_json TEXT, evaluation_json TEXT,
-                  error_code TEXT, error_message TEXT, cancel_requested_at REAL,
+                  error_code TEXT, error_message TEXT, error_details_json TEXT, cancel_requested_at REAL,
                   gpu_seconds_charged REAL NOT NULL DEFAULT 0, created_at REAL NOT NULL, updated_at REAL NOT NULL,
                   model_id TEXT
                 );
@@ -201,6 +201,7 @@ class Store:
                   pid INTEGER, process_start_time REAL, process_group_id INTEGER,
                   state TEXT NOT NULL, started_at REAL NOT NULL, last_heartbeat_at REAL NOT NULL,
                   lease_expires_at REAL NOT NULL, ended_at REAL, error_code TEXT, error_message TEXT,
+                  error_details_json TEXT,
                   progress_json TEXT, charged_seconds REAL NOT NULL DEFAULT 0,
                   UNIQUE(task_id, attempt_no), UNIQUE(task_id, fencing_token)
                 );
@@ -224,6 +225,29 @@ class Store:
                 CREATE INDEX IF NOT EXISTS jobs_owner ON jobs(owner_id, created_at);
                 """
             )
+            # The service is intentionally installed against durable volumes.  Keep
+            # schema changes additive and safe when two API/worker processes start
+            # at roughly the same time; SQLite serializes each ALTER statement.
+            additions_by_table = {
+                "jobs": {
+                    "execution_mode": "TEXT NOT NULL DEFAULT 'auto'",
+                    "waiting_for_stage": "TEXT",
+                    "evaluation_overrides_json": "TEXT NOT NULL DEFAULT '{}'",
+                    "error_details_json": "TEXT",
+                },
+                "task_attempts": {"error_details_json": "TEXT"},
+            }
+            for table, additions in additions_by_table.items():
+                columns = {row["name"] for row in c.execute(f"PRAGMA table_info({table})")}
+                for name, declaration in additions.items():
+                    if name not in columns:
+                        try:
+                            c.execute(f"ALTER TABLE {table} ADD COLUMN {name} {declaration}")
+                        except sqlite3.OperationalError as exc:
+                            # A concurrently started process may have performed the
+                            # same additive migration between the pragma and ALTER.
+                            if "duplicate column name" not in str(exc).lower():
+                                raise
 
     # ----- generic helpers -------------------------------------------------
     def _row(self, row: sqlite3.Row | None) -> dict | None:
@@ -373,6 +397,29 @@ class Store:
                     )
                 ]
             return result
+
+    def datasets(self, owner: str, *, limit: int = 50, offset: int = 0) -> dict:
+        limit, offset = self._page(limit, offset)
+        with self.reader() as c:
+            total = c.execute("SELECT COUNT(*) FROM datasets WHERE owner_id=?", (owner,)).fetchone()[0]
+            rows = c.execute(
+                "SELECT * FROM datasets WHERE owner_id=? ORDER BY created_at DESC LIMIT ? OFFSET ?",
+                (owner, limit, offset),
+            ).fetchall()
+            items = []
+            for row in rows:
+                item = dict(row)
+                item.pop("owner_id", None)
+                items.append(item)
+            return {"items": items, "total": total, "limit": limit, "offset": offset}
+
+    @staticmethod
+    def _page(limit: int, offset: int) -> tuple[int, int]:
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 100:
+            raise PipelineError("INVALID_PAGINATION", "limit must be an integer between 1 and 100")
+        if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
+            raise PipelineError("INVALID_PAGINATION", "offset must be a non-negative integer")
+        return limit, offset
 
     def upload_target(self, owner: str, dataset_id: str, file_id: str) -> tuple[dict, Path]:
         with self.reader() as c:
@@ -542,37 +589,18 @@ class Store:
             profile_id == "local-tiny-v1" and not self.settings.enable_test_backend
         ):
             raise PipelineError("UNSUPPORTED_PROFILE", "Only the local profile is available")
-        overrides = body.get("training_overrides", {})
-        if not isinstance(overrides, dict):
-            raise PipelineError("INVALID_OVERRIDES", "training_overrides must be an object")
-        # Hardware/backend/precision are operator-controlled profile properties;
-        # callers may tune only bounded training knobs.
-        allowed = {
-            "max_steps",
-            "learning_rate",
-            "rank",
-            "lora_alpha",
-            "checkpoint_every",
-            "seed",
-            "batch_size",
-            "gradient_accumulation_steps",
-        }
-        unknown = set(overrides) - allowed
-        if unknown:
-            raise PipelineError(
-                "INVALID_OVERRIDES", "Unsupported training override", details={"fields": sorted(unknown)}
-            )
+        mode = body.get("execution_mode", "auto")
+        if mode not in {"auto", "manual"}:
+            raise PipelineError("INVALID_EXECUTION_MODE", "execution_mode must be auto or manual")
+        overrides = self._validated_training_overrides(body.get("training_overrides", {}), profile_id)
         config = self.settings.train.snapshot()
         if profile_id == "local-tiny-v1":
             config.update({"backend": "tiny", "resolution": 16, "device": "cpu", "precision": "fp32"})
-        config.update(overrides)
-        # Validate before persisting the frozen snapshot.
-        from .config import TrainConfig
-
-        try:
-            TrainConfig(**config)
-        except (TypeError, ValueError) as exc:
-            raise PipelineError("INVALID_OVERRIDES", str(exc)) from exc
+        # The profile is the immutable operator-controlled baseline.  Training
+        # values live separately so manual jobs freeze them only when TRAIN is
+        # explicitly advanced.
+        if mode == "auto":
+            config.update(overrides)
         job_id, now = str(uuid.uuid4()), _now()
         with self.transaction() as c:
             dataset = self._owned(c, "datasets", dataset_id, owner)
@@ -598,8 +626,8 @@ class Store:
                 profile["config"] = config
             c.execute(
                 """INSERT INTO jobs(id,owner_id,dataset_id,state,current_stage,candidate_index,trigger_token,
-                profile_json,training_overrides_json,created_at,updated_at)
-                VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+                profile_json,training_overrides_json,evaluation_overrides_json,execution_mode,waiting_for_stage,created_at,updated_at)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     job_id,
                     owner,
@@ -609,7 +637,10 @@ class Store:
                     0,
                     trigger.strip(),
                     _json(profile),
-                    _json(overrides),
+                    _json(overrides if mode == "auto" else {}),
+                    _json({}),
+                    mode,
+                    None,
                     now,
                     now,
                 ),
@@ -619,8 +650,47 @@ class Store:
             "job_id": job_id,
             "state": "ACCEPTED",
             "current_stage": "PREPARE",
+            "execution_mode": mode,
+            "waiting_for_stage": None,
             "status_url": f"/v1/training-jobs/{job_id}",
         }
+
+    def _validated_training_overrides(
+        self, overrides: Any, profile_id: str = "local-sd15-v1", *, base_config: dict | None = None
+    ) -> dict:
+        if not isinstance(overrides, dict):
+            raise PipelineError("INVALID_OVERRIDES", "training_overrides must be an object")
+        allowed = {"max_steps", "learning_rate", "rank", "lora_alpha", "checkpoint_every", "seed", "batch_size", "gradient_accumulation_steps"}
+        unknown = set(overrides) - allowed
+        if unknown:
+            raise PipelineError("INVALID_OVERRIDES", "Unsupported training override", details={"fields": sorted(unknown)})
+        config = dict(base_config) if base_config is not None else self.settings.train.snapshot()
+        if profile_id == "local-tiny-v1":
+            config.update({"backend": "tiny", "resolution": 16, "device": "cpu", "precision": "fp32"})
+        config.update(overrides)
+        from .config import TrainConfig
+        try:
+            TrainConfig(**config)
+        except (TypeError, ValueError) as exc:
+            raise PipelineError("INVALID_OVERRIDES", str(exc)) from exc
+        return dict(overrides)
+
+    def _validated_evaluation_overrides(self, overrides: Any, profile: dict) -> dict:
+        if not isinstance(overrides, dict):
+            raise PipelineError("INVALID_OVERRIDES", "evaluation_overrides must be an object")
+        for field in ("prompts", "seeds"):
+            if field in overrides and not isinstance(overrides[field], list):
+                raise PipelineError("INVALID_OVERRIDES", f"{field} must be a list")
+        allowed = {"prompts", "seeds", "inference_steps", "guidance_scale"}
+        unknown = set(overrides) - allowed
+        if unknown:
+            raise PipelineError("INVALID_OVERRIDES", "Unsupported evaluation override", details={"fields": sorted(unknown)})
+        from .config import EvalConfig
+        try:
+            EvalConfig(**{**profile["evaluation"], **overrides})
+        except (TypeError, ValueError) as exc:
+            raise PipelineError("INVALID_OVERRIDES", str(exc)) from exc
+        return dict(overrides)
 
     def _insert_task(
         self, c: sqlite3.Connection, job_id: str, stage: str, ready_at: float | None = None
@@ -632,20 +702,26 @@ class Store:
         )
         return task_id
 
-    def job(self, owner: str, job_id: str) -> dict:
+    def job(self, owner: str, job_id: str, *, summary: bool = False) -> dict:
         with self.reader() as c:
             row = self._owned(c, "jobs", job_id, owner)
             result = dict(row)
             for field in (
                 "profile_json",
                 "training_overrides_json",
+                "evaluation_overrides_json",
                 "prepared_json",
                 "input_json",
                 "training_json",
                 "evaluation_json",
+                "error_details_json",
             ):
                 result[field.removesuffix("_json")] = _obj(result.pop(field), None)
             result.pop("owner_id", None)
+            if summary:
+                for field in ("prepared", "input", "training", "evaluation"):
+                    payload = result.get(field)
+                    result[field] = self._summary(payload) if payload else None
             result["stages"] = {}
             for stage in c.execute(
                 "SELECT id,stage,state,attempt_count FROM stage_tasks WHERE job_id=?", (job_id,)
@@ -661,6 +737,33 @@ class Store:
                 }
             return result
 
+    @staticmethod
+    def _summary(payload: dict) -> dict:
+        """Keep polling payloads bounded while preserving useful live facts."""
+        keys = {
+            "kind", "state", "manifest_path", "manifest_sha256", "global_step", "elapsed_seconds",
+            "adapter_sha256", "quality_status", "technical_pass", "test_only", "statistics", "metrics",
+            "quality_failures", "config", "input_manifest_sha256", "base_model", "base_revision",
+        }
+        return {key: value for key, value in payload.items() if key in keys}
+
+    def jobs(self, owner: str, *, limit: int = 50, offset: int = 0, state: str | None = None) -> dict:
+        limit, offset = self._page(limit, offset)
+        with self.reader() as c:
+            args: list[Any] = [owner]
+            condition = "owner_id=?"
+            if state is not None:
+                if not state or not state.replace("_", "").isalnum():
+                    raise PipelineError("INVALID_STATE", "state filter is invalid")
+                condition += " AND state=?"
+                args.append(state)
+            total = c.execute(f"SELECT COUNT(*) FROM jobs WHERE {condition}", args).fetchone()[0]
+            rows = c.execute(
+                f"SELECT id FROM jobs WHERE {condition} ORDER BY created_at DESC LIMIT ? OFFSET ?",
+                [*args, limit, offset],
+            ).fetchall()
+            return {"items": [self.job(owner, row["id"], summary=True) for row in rows], "total": total, "limit": limit, "offset": offset}
+
     def task_context(self, task: dict) -> dict:
         """Internal immutable snapshot for a claimed task; never exposed by API."""
         with self.reader() as c:
@@ -675,6 +778,7 @@ class Store:
             for field in (
                 "profile_json",
                 "training_overrides_json",
+                "evaluation_overrides_json",
                 "prepared_json",
                 "input_json",
                 "training_json",
@@ -682,6 +786,39 @@ class Store:
             ):
                 result[field.removesuffix("_json")] = _obj(result.pop(field), None)
             return {"task": task, "job": result, "dataset": dict(dataset), "files": [dict(x) for x in files]}
+
+    def advance_job(self, owner: str, job_id: str, body: dict) -> dict:
+        stage = body.get("stage")
+        if stage not in {"TRAIN", "EVALUATE", "PUBLISH"}:
+            raise PipelineError("INVALID_STAGE", "stage must be TRAIN, EVALUATE, or PUBLISH")
+        with self.transaction() as c:
+            job = self._owned(c, "jobs", job_id, owner)
+            if job["state"] in TERMINAL_JOBS:
+                raise PipelineError("JOB_TERMINAL", "Job is already terminal")
+            if job["state"] != "WAITING_FOR_USER" or job["waiting_for_stage"] != stage:
+                raise PipelineError("ADVANCE_CONFLICT", "Job is not waiting for this stage")
+            profile = _obj(job["profile_json"])
+            if stage == "TRAIN":
+                if "evaluation_overrides" in body:
+                    raise PipelineError("INVALID_OVERRIDES", "evaluation_overrides apply only to EVALUATE")
+                overrides = self._validated_training_overrides(
+                    body.get("training_overrides", {}), profile["profile_revision_id"], base_config=profile["config"]
+                )
+                c.execute("UPDATE jobs SET training_overrides_json=? WHERE id=?", (_json(overrides), job_id))
+            elif stage == "EVALUATE":
+                if "training_overrides" in body:
+                    raise PipelineError("INVALID_OVERRIDES", "training_overrides apply only to TRAIN")
+                overrides = self._validated_evaluation_overrides(body.get("evaluation_overrides", {}), profile)
+                c.execute("UPDATE jobs SET evaluation_overrides_json=? WHERE id=?", (_json(overrides), job_id))
+            elif body.get("training_overrides") or body.get("evaluation_overrides"):
+                raise PipelineError("INVALID_OVERRIDES", "PUBLISH does not accept stage overrides")
+            now = _now()
+            self._insert_task(c, job_id, stage, now)
+            c.execute(
+                "UPDATE jobs SET state='ACCEPTED',current_stage=?,waiting_for_stage=NULL,updated_at=? WHERE id=?",
+                (stage, now, job_id),
+            )
+        return {"job_id": job_id, "state": "ACCEPTED", "current_stage": stage, "waiting_for_stage": None, "status_url": f"/v1/training-jobs/{job_id}"}
 
     def cancel_job(self, owner: str, job_id: str) -> dict:
         with self.transaction() as c:
@@ -699,7 +836,12 @@ class Store:
                 "UPDATE stage_tasks SET state='CANCELLED',updated_at=? WHERE job_id=? AND state IN ('PENDING','RETRY_WAIT')",
                 (now, job_id),
             )
-            return {"job_id": job_id, "state": "CANCEL_REQUESTED"}
+            running = c.execute("SELECT COUNT(*) FROM stage_tasks WHERE job_id=? AND state='RUNNING'", (job_id,)).fetchone()[0]
+            state = "CANCEL_REQUESTED"
+            if not running:
+                state = "CANCELLED"
+                c.execute("UPDATE jobs SET state='CANCELLED',updated_at=? WHERE id=?", (now, job_id))
+            return {"job_id": job_id, "state": state}
 
     # ----- scheduling / attempts ------------------------------------------
     def heartbeat(self) -> None:
@@ -891,7 +1033,7 @@ class Store:
         """Fence results and atomically add the workflow successor."""
         with self.transaction() as c:
             row = c.execute(
-                """SELECT a.task_id,a.fencing_token,a.gpu_slot,a.started_at,a.progress_json,t.*,j.state job_state,j.id job_id
+                """SELECT a.task_id,a.fencing_token,a.gpu_slot,a.started_at,a.progress_json,t.*,j.state job_state,j.id job_id,j.execution_mode
                 FROM task_attempts a JOIN stage_tasks t ON t.id=a.task_id JOIN jobs j ON j.id=t.job_id WHERE a.id=?""",
                 (attempt_id,),
             ).fetchone()
@@ -944,6 +1086,25 @@ class Store:
                     (_json(output["prepared"]), _json(output["_input"]), now, job_id),
                 )
                 next_stage = "TRAIN"
+            # PREPARE->CAPTION remains automatic: captioning is part of producing
+            # the frozen training input.  Manual jobs pause exactly once that input
+            # exists, and again after training and evaluation.
+            if row["execution_mode"] == "manual" and stage in {"CAPTION", "TRAIN", "EVALUATE"}:
+                if stage == "EVALUATE" and output.get("quality_status") == "FAIL":
+                    pass
+                else:
+                    wait_for = {"CAPTION": "TRAIN", "TRAIN": "EVALUATE", "EVALUATE": "PUBLISH"}[stage]
+                    c.execute(
+                        "UPDATE jobs SET state='WAITING_FOR_USER',current_stage=?,waiting_for_stage=?,updated_at=? WHERE id=?",
+                        (stage, wait_for, now, job_id),
+                    )
+                    next_stage = None
+            if row["execution_mode"] == "manual" and stage == "PREPARE" and output.get("_input"):
+                c.execute(
+                    "UPDATE jobs SET state='WAITING_FOR_USER',current_stage='PREPARE',waiting_for_stage='TRAIN',updated_at=? WHERE id=?",
+                    (now, job_id),
+                )
+                next_stage = None
             if next_stage:
                 self._insert_task(c, job_id, next_stage, now)
                 c.execute(
@@ -979,12 +1140,13 @@ class Store:
                 and not cancelled
             )
             c.execute(
-                "UPDATE task_attempts SET state=?,ended_at=?,error_code=?,error_message=? WHERE id=?",
+                "UPDATE task_attempts SET state=?,ended_at=?,error_code=?,error_message=?,error_details_json=? WHERE id=?",
                 (
                     "RETRY_WAIT" if can_retry else ("CANCELLED" if cancelled else "FAILED"),
                     now,
                     error.code,
                     error.message,
+                    _json(error.details),
                     attempt_id,
                 ),
             )
@@ -1004,8 +1166,16 @@ class Store:
                     ("CANCELLED" if cancelled else "FAILED", now, row["task_id"]),
                 )
                 c.execute(
-                    "UPDATE jobs SET state=?,error_code=?,error_message=?,current_stage=?,updated_at=? WHERE id=?",
-                    (job_state, error.code, error.message, row["stage"], now, row["job_id"]),
+                    "UPDATE jobs SET state=?,error_code=?,error_message=?,error_details_json=?,current_stage=?,updated_at=? WHERE id=?",
+                    (
+                        job_state,
+                        error.code,
+                        error.message,
+                        _json(error.details),
+                        row["stage"],
+                        now,
+                        row["job_id"],
+                    ),
                 )
             return True
 
@@ -1098,6 +1268,78 @@ class Store:
         if not job.get("evaluation"):
             raise PipelineError("EVALUATION_NOT_READY", "Evaluation report is not available")
         return job["evaluation"]
+
+    def artifacts_for_job(self, owner: str, job_id: str) -> list[dict]:
+        """Return only artifact paths referenced by completed stage manifests.
+
+        IDs are deterministic within a job so clients can refresh safely.  The
+        path is never accepted back from a client; download resolves it from this
+        registered manifest data and checks it remains below the job artifact root.
+        """
+        job = self.job(owner, job_id)
+        records: list[dict] = []
+
+        def add(kind: str, path: Any, label: str, **meta: Any) -> None:
+            if not isinstance(path, str) or not path:
+                return
+            index = sum(1 for item in records if item["kind"] == kind)
+            records.append({"id": f"{kind}-{index}", "kind": kind, "label": label, "path": path, **meta})
+
+        prepared = job.get("prepared") or {}
+        frozen_input = job.get("input") or {}
+        frozen_captions = {
+            item.get("id"): item.get("caption")
+            for split in ("train", "validation")
+            for item in frozen_input.get(split, [])
+            if item.get("id") and item.get("caption")
+        }
+        add("prepared_manifest", prepared.get("manifest_path"), "Prepared dataset manifest", media_type="application/json")
+        for split in ("train", "validation"):
+            for item in prepared.get(split, []):
+                add("prepared_image", item.get("path"), item.get("name") or "Prepared image", media_type="image/png", name=item.get("name"), caption=frozen_captions.get(item.get("id"), item.get("caption")), split=split)
+        add("input_manifest", frozen_input.get("manifest_path"), "Training input manifest", media_type="application/json")
+        training = job.get("training") or {}
+        add("training_manifest", training.get("manifest_path"), "Training manifest", media_type="application/json")
+        evaluation = job.get("evaluation") or {}
+        add("evaluation_report", evaluation.get("manifest_path"), "Evaluation report", media_type="application/json")
+        for index, pair in enumerate(evaluation.get("paired_outputs", [])):
+            prompt, seed = pair.get("prompt"), pair.get("seed")
+            for variant, key in (("base", "base_image"), ("adapter", "adapter_image")):
+                raw = pair.get(key)
+                if isinstance(raw, str):
+                    # Evaluation stores image paths relative to the report directory.
+                    report_path = evaluation.get("manifest_path")
+                    path = str(Path(report_path).parent / raw) if isinstance(report_path, str) else raw
+                    add("evaluation_image", path, f"{variant.title()} evaluation image", media_type="image/png", prompt=prompt, seed=seed, pair_index=index, variant=variant)
+        return records
+
+    def artifact_for_job(self, owner: str, job_id: str, artifact_id: str) -> dict:
+        record = next((item for item in self.artifacts_for_job(owner, job_id) if item["id"] == artifact_id), None)
+        if record is None:
+            raise PipelineError("NOT_FOUND", "Artifact was not found")
+        root = (self.artifacts / job_id).resolve()
+        declared = Path(record["path"]).absolute()
+        # Reject links at every component, including a link to another file
+        # within this job.  Artifact manifests are data and must not become an
+        # escape hatch to operator-owned paths.
+        cursor = declared
+        while True:
+            if cursor.is_symlink():
+                raise PipelineError("NOT_FOUND", "Artifact was not found")
+            if cursor == root or cursor.parent == cursor:
+                break
+            cursor = cursor.parent
+        try:
+            path = declared.resolve(strict=True)
+        except OSError as exc:
+            raise PipelineError("NOT_FOUND", "Artifact was not found") from exc
+        try:
+            path.relative_to(root)
+        except ValueError as exc:
+            raise PipelineError("NOT_FOUND", "Artifact was not found") from exc
+        if not path.is_file() or path.is_symlink():
+            raise PipelineError("NOT_FOUND", "Artifact was not found")
+        return {**record, "path": str(path)}
 
     def publish(self, attempt_id: str, token: int, manifest: dict, report: dict) -> dict | None:
         with self.transaction() as c:

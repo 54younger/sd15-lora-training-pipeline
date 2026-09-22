@@ -14,6 +14,7 @@ import os
 import signal
 import threading
 import time
+import traceback
 from dataclasses import replace
 from pathlib import Path
 
@@ -32,9 +33,30 @@ def _process_started_at(pid: int) -> float | None:
         return None
 
 
+def _traceback_locations(exc: BaseException, *, limit: int = 12) -> list[dict[str, object]]:
+    """Return useful call locations without copying exception text or locals to logs."""
+    frames = traceback.extract_tb(exc.__traceback__)
+    return [
+        {"file": Path(frame.filename).name, "line": frame.lineno, "function": frame.name}
+        for frame in frames[-limit:]
+    ]
+
+
+def _unexpected_worker_error(stage: str, exc: Exception) -> PipelineError:
+    exception_type = type(exc).__name__
+    return PipelineError(
+        "WORKER_EXCEPTION",
+        f"Unexpected {exception_type} while executing {stage}. Check worker logs for traceback locations.",
+        retryable=True,
+        details={"exception_type": exception_type},
+    )
+
+
 def _run_stage_child(settings: Settings, task: dict) -> None:
     """Forked stage executor. It owns only its exact attempt token."""
     os.setsid()
+    # Spawn starts a fresh interpreter, so configure the child logger as well.
+    configure_logging()
     if task.get("gpu_slot") and not str(task["gpu_slot"]).startswith("cpu-test-"):
         # UUID selection before lazy torch/diffusers imports makes the adapter
         # see a single physical device as cuda:0.
@@ -262,10 +284,12 @@ class Worker:
                 retryable=exc.retryable,
             )
         except Exception as exc:  # unexpected worker/model failure is an infrastructure retry
+            error = _unexpected_worker_error(task["stage"], exc)
+            locations = _traceback_locations(exc)
             self.store.fail_task(
                 task["attempt_id"],
                 task["token"],
-                PipelineError("WORKER_EXCEPTION", str(exc), retryable=True),
+                error,
                 retry=True,
             )
             log_event(
@@ -274,8 +298,10 @@ class Worker:
                 task_id=task["id"],
                 attempt_id=task["attempt_id"],
                 stage=task["stage"],
-                code="WORKER_EXCEPTION",
+                code=error.code,
                 retryable=True,
+                exception_type=type(exc).__name__,
+                traceback_locations=locations,
             )
 
     def _stage(self, stage: str, context: dict, task: dict) -> dict:
@@ -352,7 +378,9 @@ class Worker:
 
             if not job.get("training") or not job.get("input"):
                 raise PipelineError("MISSING_TRAINING_INPUT", "Evaluation task has no frozen inputs")
-            config = EvalConfig(**job["profile"]["evaluation"])
+            # Evaluation choices are frozen when a manual job enters EVALUATE;
+            # the profile remains the operator-controlled immutable baseline.
+            config = EvalConfig(**{**job["profile"]["evaluation"], **(job.get("evaluation_overrides") or {})})
             if task.get("gpu_slot", "").startswith("cpu-test-"):
                 config = replace(config, device="cpu")
             return evaluate(job["training"], job["input"], root, config, progress=progress)

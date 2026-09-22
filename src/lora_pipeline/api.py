@@ -7,11 +7,11 @@ import tempfile
 import time
 import uuid
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
-from fastapi import FastAPI, Header, Request
+from fastapi import FastAPI, Header, Query, Request
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, Response
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from .common import PipelineError
 from .config import Settings
@@ -36,6 +36,17 @@ class TrainingJobRequest(BaseModel):
     profile_revision_id: str = "local-sd15-v1"
     trigger_token: str
     training_overrides: dict[str, Any] = Field(default_factory=dict)
+    execution_mode: Literal["auto", "manual"] = "auto"
+
+
+class AdvanceJobRequest(BaseModel):
+    """The explicit user confirmation that queues one manual stage."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    stage: Literal["TRAIN", "EVALUATE", "PUBLISH"]
+    training_overrides: dict[str, Any] = Field(default_factory=dict)
+    evaluation_overrides: dict[str, Any] = Field(default_factory=dict)
 
 
 def create_app(settings: Settings):
@@ -99,6 +110,8 @@ def create_app(settings: Settings):
             "DATASET_TERMINAL",
             "UPLOAD_NOT_ALLOWED",
             "MODEL_NOT_READY",
+            "ADVANCE_CONFLICT",
+            "INVALID_STAGE",
         }:
             return 409
         if exc.code in {"ADMISSION_LIMIT"}:
@@ -188,6 +201,12 @@ def create_app(settings: Settings):
         )
         return JSONResponse(status_code=status, content=result)
 
+    @app.get("/v1/datasets")
+    def list_datasets(
+        limit: int = Query(default=50), offset: int = Query(default=0), authorization: str | None = Header(default=None)
+    ):
+        return store.datasets(require_owner(authorization), limit=limit, offset=offset)
+
     @app.put("/v1/datasets/{dataset_id}/files/{file_id}", status_code=204)
     async def upload_file(
         dataset_id: str, file_id: str, request: Request, authorization: str | None = Header(default=None)
@@ -231,8 +250,8 @@ def create_app(settings: Settings):
         )
 
     @app.get("/v1/datasets/{dataset_id}")
-    def get_dataset(dataset_id: str, authorization: str | None = Header(default=None)):
-        return store.dataset(require_owner(authorization), dataset_id)
+    def get_dataset(dataset_id: str, include_files: bool = False, authorization: str | None = Header(default=None)):
+        return store.dataset(require_owner(authorization), dataset_id, include_files=include_files)
 
     @app.get("/v1/training-profiles")
     def profiles(authorization: str | None = Header(default=None)):
@@ -262,9 +281,35 @@ def create_app(settings: Settings):
         )
         return JSONResponse(status_code=status, content=result, headers={"Location": result["status_url"]})
 
+    @app.get("/v1/training-jobs")
+    def list_jobs(
+        limit: int = Query(default=50), offset: int = Query(default=0), state: str | None = None,
+        authorization: str | None = Header(default=None),
+    ):
+        return store.jobs(require_owner(authorization), limit=limit, offset=offset, state=state)
+
     @app.get("/v1/training-jobs/{job_id}")
-    def get_job(job_id: str, authorization: str | None = Header(default=None)):
-        return store.job(require_owner(authorization), job_id)
+    def get_job(job_id: str, view: str | None = None, authorization: str | None = Header(default=None)):
+        if view not in {None, "summary"}:
+            raise PipelineError("INVALID_VIEW", "view must be summary")
+        return store.job(require_owner(authorization), job_id, summary=view == "summary")
+
+    @app.post("/v1/training-jobs/{job_id}/advance")
+    async def advance_job(
+        job_id: str,
+        request: Request,
+        payload: AdvanceJobRequest,
+        authorization: str | None = Header(default=None),
+    ):
+        actor, payload = require_owner(authorization), payload.model_dump(exclude_unset=True)
+        status, result = idem(
+            request,
+            f"POST /v1/training-jobs/{job_id}/advance",
+            actor,
+            payload,
+            lambda: (202, store.advance_job(actor, job_id, payload)),
+        )
+        return JSONResponse(status_code=status, content=result, headers={"Location": result["status_url"]})
 
     @app.post("/v1/training-jobs/{job_id}/cancel")
     async def cancel_job(job_id: str, request: Request, authorization: str | None = Header(default=None)):
@@ -281,6 +326,17 @@ def create_app(settings: Settings):
     @app.get("/v1/training-jobs/{job_id}/evaluation")
     def get_evaluation(job_id: str, authorization: str | None = Header(default=None)):
         return store.evaluation(require_owner(authorization), job_id)
+
+    @app.get("/v1/training-jobs/{job_id}/artifacts")
+    def list_artifacts(job_id: str, authorization: str | None = Header(default=None)):
+        actor = require_owner(authorization)
+        artifacts = store.artifacts_for_job(actor, job_id)
+        return {"artifacts": [{key: value for key, value in item.items() if key != "path"} | {"url": f"/v1/training-jobs/{job_id}/artifacts/{item['id']}"} for item in artifacts]}
+
+    @app.get("/v1/training-jobs/{job_id}/artifacts/{artifact_id}")
+    def download_artifact(job_id: str, artifact_id: str, authorization: str | None = Header(default=None)):
+        artifact = store.artifact_for_job(require_owner(authorization), job_id, artifact_id)
+        return FileResponse(artifact["path"], filename=Path(artifact["path"]).name, media_type=artifact["media_type"])
 
     @app.get("/v1/models/{model_id}")
     def get_model(model_id: str, authorization: str | None = Header(default=None)):

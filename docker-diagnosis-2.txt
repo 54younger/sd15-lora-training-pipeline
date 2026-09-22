@@ -1,0 +1,63 @@
+## Compose services
+NAME                            IMAGE                       COMMAND                  SERVICE   CREATED          STATUS                    PORTS
+creaition_assignment-api-1      local-lora-pipeline:0.1.0   "lora-pipeline api -…"   api       36 minutes ago   Up 36 minutes (healthy)   127.0.0.1:8000->8000/tcp
+creaition_assignment-web-1      local-lora-studio:0.1.0     "/docker-entrypoint.…"   web       15 minutes ago   Up 15 minutes (healthy)   127.0.0.1:8080->80/tcp
+creaition_assignment-worker-1   local-lora-pipeline:0.1.0   "lora-pipeline worker"   worker    36 minutes ago   Up 36 minutes (healthy)   8000/tcp
+
+## Recent worker logs
+worker-1  | {"timestamp": "2026-09-22T04:40:16.070535+00:00", "event": "verification_started", "dataset_id": "3a17aa8f-66ad-4173-8dba-41a1175dfae6"}
+worker-1  | {"timestamp": "2026-09-22T04:40:17.353849+00:00", "event": "stage_started", "job_id": "028ff561-a2dc-4d5b-af82-9aba4bc2ce80", "task_id": "b0e635cb-4613-44e4-a7d7-a0f42c14078d", "attempt_id": "c2bcd309-f1db-4114-92e4-2563a18774cb", "stage": "PREPARE"}
+worker-1  | {"timestamp": "2026-09-22T04:40:40.885532+00:00", "event": "stage_started", "job_id": "028ff561-a2dc-4d5b-af82-9aba4bc2ce80", "task_id": "9541f64e-0870-4ccc-ac86-420b3b5ac844", "attempt_id": "bf8053f7-7d4c-4937-9d23-99e982a58595", "stage": "CAPTION"}
+worker-1  | {"timestamp": "2026-09-22T04:40:58.212438+00:00", "event": "stage_started", "job_id": "028ff561-a2dc-4d5b-af82-9aba4bc2ce80", "task_id": "f8fd12ac-5d8b-43df-9517-bf7311296c29", "attempt_id": "9846c25f-5a2c-4269-a62f-46a2332d97da", "stage": "TRAIN"}
+worker-1  | {"timestamp": "2026-09-22T04:41:02.962786+00:00", "event": "stage_started", "job_id": "028ff561-a2dc-4d5b-af82-9aba4bc2ce80", "task_id": "f8fd12ac-5d8b-43df-9517-bf7311296c29", "attempt_id": "8ada6f0f-fd61-45f5-970b-ba0ad7e284ae", "stage": "TRAIN"}
+worker-1  | {"timestamp": "2026-09-22T04:41:08.506409+00:00", "event": "stage_started", "job_id": "028ff561-a2dc-4d5b-af82-9aba4bc2ce80", "task_id": "f8fd12ac-5d8b-43df-9517-bf7311296c29", "attempt_id": "3661948d-824b-48b3-997e-ba578cdf85b1", "stage": "TRAIN"}
+worker-1  | {"timestamp": "2026-09-22T04:58:52.765771+00:00", "event": "verification_started", "dataset_id": "9c78e62b-48c2-4eb4-9ed8-0d47417d4692"}
+worker-1  | {"timestamp": "2026-09-22T04:58:53.786706+00:00", "event": "stage_started", "job_id": "ab50bc2e-8be3-471c-a4a8-06d6228d9310", "task_id": "fb309819-e5d1-4b79-af3d-d960b885d00c", "attempt_id": "2e432a6d-58c4-4598-a4eb-8e7737f01f17", "stage": "PREPARE"}
+worker-1  | {"timestamp": "2026-09-22T04:59:15.545389+00:00", "event": "stage_started", "job_id": "ab50bc2e-8be3-471c-a4a8-06d6228d9310", "task_id": "67bb76c7-8ad2-4d29-8e2a-cdb808e57ae0", "attempt_id": "96b51cf6-0fd0-4b0c-852b-a82544f56dbe", "stage": "CAPTION"}
+worker-1  | {"timestamp": "2026-09-22T05:00:23.054667+00:00", "event": "stage_started", "job_id": "ab50bc2e-8be3-471c-a4a8-06d6228d9310", "task_id": "f759bc8e-907d-41ce-a525-393e82e86fe4", "attempt_id": "cd105492-5ff8-4e93-b24a-b7cf5203afd0", "stage": "TRAIN"}
+worker-1  | {"timestamp": "2026-09-22T05:00:26.729797+00:00", "event": "stage_started", "job_id": "ab50bc2e-8be3-471c-a4a8-06d6228d9310", "task_id": "f759bc8e-907d-41ce-a525-393e82e86fe4", "attempt_id": "c8418c6b-9c05-4663-bca8-58312c076c8a", "stage": "TRAIN"}
+worker-1  | {"timestamp": "2026-09-22T05:00:32.185472+00:00", "event": "stage_started", "job_id": "ab50bc2e-8be3-471c-a4a8-06d6228d9310", "task_id": "f759bc8e-907d-41ce-a525-393e82e86fe4", "attempt_id": "4771f5ed-44e3-4669-8882-40d510bae733", "stage": "TRAIN"}
+
+## Worker-side training initialization checks
+
+### Runtime
+pid: 16514
+initial CUDA_VISIBLE_DEVICES: None
+LORA_GPU_UUIDS: 
+[nvidia-smi] starting
+[nvidia-smi] OK: '0, GPU-58057fd8-8f47-7150-1dea-864f0ceabef7, NVIDIA GeForce RTX 4060 Ti'
+
+### Latest failed web job
+job: {'id': 'ab50bc2e-8be3-471c-a4a8-06d6228d9310', 'state': 'FAILED', 'error_code': 'WORKER_EXCEPTION', 'error_message': 'Invalid device argument ', 'updated_at': 1790053233.5737786}
+attempts:
+  {'stage': 'PREPARE', 'attempt_no': 1, 'state': 'SUCCEEDED', 'gpu_slot': None, 'error_code': None, 'error_message': None, 'started_at': 1790053133.7800894, 'ended_at': 1790053155.422486}
+  {'stage': 'CAPTION', 'attempt_no': 1, 'state': 'SUCCEEDED', 'gpu_slot': None, 'error_code': None, 'error_message': None, 'started_at': 1790053155.5383458, 'ended_at': 1790053155.6699858}
+  {'stage': 'TRAIN', 'attempt_no': 1, 'state': 'RETRY_WAIT', 'gpu_slot': 'GPU-58057fd8-8f47-7150-1dea-864f0ceabef7', 'error_code': 'WORKER_EXCEPTION', 'error_message': 'Invalid device argument ', 'started_at': 1790053223.0490534, 'ended_at': 1790053224.5292063}
+  {'stage': 'TRAIN', 'attempt_no': 2, 'state': 'RETRY_WAIT', 'gpu_slot': 'GPU-58057fd8-8f47-7150-1dea-864f0ceabef7', 'error_code': 'WORKER_EXCEPTION', 'error_message': 'Invalid device argument ', 'started_at': 1790053226.727696, 'ended_at': 1790053228.133121}
+  {'stage': 'TRAIN', 'attempt_no': 3, 'state': 'FAILED', 'gpu_slot': 'GPU-58057fd8-8f47-7150-1dea-864f0ceabef7', 'error_code': 'WORKER_EXCEPTION', 'error_message': 'Invalid device argument ', 'started_at': 1790053232.181365, 'ended_at': 1790053233.5737786}
+failed TRAIN gpu_slot: GPU-58057fd8-8f47-7150-1dea-864f0ceabef7
+diagnostic CUDA_VISIBLE_DEVICES: GPU-58057fd8-8f47-7150-1dea-864f0ceabef7
+torch: 2.8.0+cu128
+torch CUDA build: 12.8
+CUDA available: True
+CUDA device count: 1
+training config: {'backend': 'sd15', 'device': 'cuda:0', 'precision': 'fp16', 'resolution': 512, 'max_steps': 500, 'model_name': 'stable-diffusion-v1-5/stable-diffusion-v1-5', 'revision': None, 'local_files_only': False}
+input keys: ['captioning', 'dataset_id', 'manifest_path', 'manifest_sha256', 'prepared_manifest_path', 'prepared_manifest_sha256', 'schema_version', 'train', 'validation']
+
+### Exact pre-model-load sequence
+[validate_input_integrity] starting
+[validate_input_integrity] OK: None
+[safe_device] starting
+[safe_device] OK: device(type='cuda', index=0)
+[seed_everything] starting
+[seed_everything] OK: None
+[compatibility_key] starting
+[compatibility_key] OK: '08d54487ba85dee49f6629035cd7f8f69b2c650eadbed916cf9bfed80b8fb871'
+[cuda_tensor] starting
+[cuda_tensor] OK: [2.0]
+[reset_peak_memory_stats] starting
+[reset_peak_memory_stats] OK: None
+[memory_allocated] starting
+[memory_allocated] OK: 0
+
+Diagnostic complete; no model was loaded and no training was started.

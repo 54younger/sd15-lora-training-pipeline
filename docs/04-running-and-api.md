@@ -1,6 +1,8 @@
 # 运行、验收与 API 指南
 
-本文是实现边界和验收证据的索引。完整 GPU Docker runbook（IBean 准备、`dc run` heredoc、真实训练、评估和 benchmark 命令）在根目录 [README.md](../README.md) 的 Part 2；这里保留入口、判据和 API 合约，避免复制会漂移的长脚本。更完整的作业导航见 [00-assignment-guide.md](00-assignment-guide.md)。
+使用网站完成手动四步流程，见 [浏览器工作台部署与操作指南](06-web-studio.md)。下文保留 CLI/API 自动流程及 GPU 验收说明。
+
+本文是实现边界和验收证据的索引。完整 GPU Docker runbook（IBean 准备、`dc run` heredoc、真实训练、评估和 benchmark 命令）在 [Docker CLI 训练与 GPU 验收指南](07-docker-cli-training.md)；这里保留入口、判据和 API 合约。更完整的作业导航见 [00-assignment-guide.md](00-assignment-guide.md)。
 
 ## 先区分三种证据
 
@@ -8,7 +10,7 @@
 - **10-step GPU smoke** 是目标 NVIDIA 主机功能验收：真实 SD 1.5、5 步中断后恢复、adapter 重载和小评估。它不是容量 benchmark，也不是质量阈值。
 - **100-step GPU performance** 是固定真实输入和 pinned 基座上的性能实验，要求一次 warm-up 加至少三次完整运行；它与质量评估是不同证据。质量只来自固定 prompt/seed 的 paired base/adapter 评估和已校准 policy。
 
-推荐真实验收数据是 IBean 本地副本：`datasets/ibean/images/` 中 999 张图（每类 333 张）和 `captions.json`，不是合成数据，也不是校准的风格质量集。下载、许可证、SHA-256 和整理方式以 [README](../README.md) 的 IBean 小节为准。
+推荐真实验收数据是 IBean 本地副本：`datasets/ibean/images/` 中 999 张图（每类 333 张）和 `captions.json`，不是合成数据，也不是校准的风格质量集。下载、许可证、SHA-256 和整理方式以 [Docker CLI 指南的 IBean 小节](07-docker-cli-training.md#推荐的本地验证数据集ibean) 为准。
 
 ## 本地安装与 CPU 回归
 
@@ -64,11 +66,11 @@ dc run --rm --no-deps worker lora-pipeline preflight
 
 没有 socket 权限时把函数体改成 `sudo docker compose ...`；不要执行 `sudo dc ...`。PowerShell 使用 `function dc { docker compose -f compose.yaml -f compose.gpu.yaml @args }`。确认 `preflight` 的 `cuda_available`、允许的 GPU UUID 和显存正确后再继续。
 
-README 的模块 1–4 是唯一 GPU 主 runbook。其 heredoc 容器命令使用 `-i -T`：`-i` 传 stdin，`-T` 禁用伪终端，兼容 SSH/CI/重定向；缺少 `-T` 会出现 `the input device is not a TTY`，不要手工伪造 manifest。`/data` 是容器内的 Compose named volume 路径，**不是宿主机 `/data`**；一次性容器 `--rm` 后文件仍在 `pipeline-data`，宿主机需用 `dc run ... cat` 或 `dc cp` 导出。
+Docker CLI 指南的模块 1–4 是唯一 GPU 主 runbook。其 heredoc 容器命令使用 `-i -T`：`-i` 传 stdin，`-T` 禁用伪终端，兼容 SSH/CI/重定向；缺少 `-T` 会出现 `the input device is not a TTY`，不要手工伪造 manifest。`/data` 是容器内的 Compose named volume 路径，**不是宿主机 `/data`**；一次性容器 `--rm` 后文件仍在 `pipeline-data`，宿主机需用 `dc run ... cat` 或 `dc cp` 导出。
 
 ### 模型缓存、训练和进度
 
-首次训练联网预热 `model-cache`，解析 immutable commit，并生成 `/data/sd15-smoke-pinned.json`；之后训练/恢复使用 pinned 配置和 `local_files_only=true`，下载时间不计入性能。详见 [README](../README.md) 的 Training 模块。
+首次训练联网预热 `model-cache`，解析 immutable commit，并生成 `/data/sd15-smoke-pinned.json`；之后训练/恢复使用 pinned 配置和 `local_files_only=true`，下载时间不计入性能。详见 [Docker CLI 指南的 Training 模块](07-docker-cli-training.md#模块-2training)。
 
 基座下载失败归类为 `BASE_MODEL_UNAVAILABLE`，不是 `CHECKPOINT_CORRUPT`、`CHECKPOINT_INCOMPATIBLE` 或 OOM；错误 details 只暴露脱敏模型/revision、缓存/offline 等受控分类，不承诺原始 root cause。先修复网络、认证、缓存或磁盘，再离线检查，不能反复启动训练代替预热。frozen input checksum 不一致时保留 path/expected/actual，重新 build 后完整重跑 prepare+caption 生成新 manifest；不要编辑旧 manifest 或跳过校验。规范化图片以最终 PNG 字节 SHA-256 内容寻址，新 encoder 不覆盖仍被旧 manifest 引用的文件。
 

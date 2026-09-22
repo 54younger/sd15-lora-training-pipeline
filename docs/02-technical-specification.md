@@ -4,8 +4,11 @@
 
 ## 1. 组件、持久化与制品链
 
+浏览器工作台及新增接口见 [Web Studio 指南](06-web-studio.md)。默认 `execution_mode=auto` 保留下文自动编排；`manual` 在冻结输入、训练、评估之后进入 `WAITING_FOR_USER`，由带幂等键的 `advance` 请求启动 `waiting_for_stage`。基础 profile 始终冻结，手动任务的训练/评估 overrides 在相应阶段首次入队时分别冻结。
+
 | 组件 | 当前职责 | 关键证据 |
 |---|---|---|
+| Web | 英文四步向导、caption 编辑、有界上传、参数表单、状态/历史、产物预览下载；Nginx 同源代理 | [frontend](../frontend/) |
 | API | Bearer owner、有界流式上传、校验请求、必要 mutation 幂等、状态/取消/下载、health、admin metrics | [api.py](../src/lora_pipeline/api.py) |
 | Store | SQLite schema/短事务、配额、队列、attempt/lease/fencing、owner 隔离、唯一 model | [store.py](../src/lora_pipeline/store.py) |
 | Worker | singleton supervisor、VERIFY、stage 子进程、heartbeat/watchdog、取消、恢复、资源调度 | [worker.py](../src/lora_pipeline/worker.py) |

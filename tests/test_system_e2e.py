@@ -7,9 +7,11 @@ import os
 import subprocess
 import sys
 import time
+import concurrent.futures
 from pathlib import Path
 
 from fastapi.testclient import TestClient
+import pytest
 
 from lora_pipeline.api import create_app
 from lora_pipeline.common import sha256_file
@@ -17,7 +19,8 @@ from lora_pipeline.config import EvalConfig, Settings, TrainConfig
 from lora_pipeline.data import generate_synthetic_dataset
 
 
-def test_http_dataset_to_independent_worker_and_unverified_download(tmp_path):
+@pytest.mark.parametrize("manual", [False, True])
+def test_http_dataset_to_independent_worker_and_unverified_download(tmp_path, manual):
     raw = {
         "data_dir": str(tmp_path / "service"),
         "api_keys": {"alice-key": "alice", "bob-key": "bob"},
@@ -110,11 +113,70 @@ def test_http_dataset_to_independent_worker_and_unverified_download(tmp_path):
                     "dataset_id": dataset_id,
                     "profile_revision_id": "local-tiny-v1",
                     "trigger_token": "geometry",
+                    "execution_mode": "manual" if manual else "auto",
                 },
                 headers={**headers, "Idempotency-Key": "train"},
             )
             assert response.status_code == 202, response.text
             job_id = response.json().get("job_id", response.json().get("id"))
+            if manual:
+                def wait_for_waiting(stage: str):
+                    latest = None
+                    while time.monotonic() < deadline:
+                        latest = client.get(f"/v1/training-jobs/{job_id}", headers=headers).json()
+                        if latest["state"] == "WAITING_FOR_USER" and latest["waiting_for_stage"] == stage:
+                            assert stage not in latest["stages"]
+                            # Reloading after a pause must not enqueue work by itself.
+                            time.sleep(0.25)
+                            reloaded = client.get(f"/v1/training-jobs/{job_id}", headers=headers).json()
+                            assert (reloaded["state"], reloaded["waiting_for_stage"], reloaded["stages"]) == (
+                                latest["state"], latest["waiting_for_stage"], latest["stages"]
+                            )
+                            return reloaded
+                        assert process.poll() is None, log_path.read_text()
+                        time.sleep(0.1)
+                    raise AssertionError(f"Timed out waiting for {stage}: {latest}\n{log_path.read_text()}")
+
+                wait_for_waiting("TRAIN")
+
+                def advance_once(key: str):
+                    with TestClient(create_app(settings)) as another_client:
+                        return another_client.post(
+                            f"/v1/training-jobs/{job_id}/advance",
+                            json={"stage": "TRAIN", "training_overrides": {"max_steps": 2, "seed": 7}},
+                            headers={**headers, "Idempotency-Key": key},
+                        )
+
+                # Separate idempotency keys still race through the same atomic
+                # expected-stage check: exactly one task enters the queue.
+                with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+                    advances = list(executor.map(advance_once, ["advance-a", "advance-b"]))
+                assert sorted(value.status_code for value in advances) == [202, 409]
+                successful_key = next(
+                    key for key, response in zip(["advance-a", "advance-b"], advances, strict=True)
+                    if response.status_code == 202
+                )
+                replay = client.post(
+                    f"/v1/training-jobs/{job_id}/advance",
+                    json={"stage": "TRAIN", "training_overrides": {"max_steps": 2, "seed": 7}},
+                    headers={**headers, "Idempotency-Key": successful_key},
+                )
+                assert replay.status_code == 202
+                job_after_advance = client.get(f"/v1/training-jobs/{job_id}", headers=headers).json()
+                assert job_after_advance["training_overrides"] == {"max_steps": 2, "seed": 7}
+                wait_for_waiting("EVALUATE")
+                response = client.post(
+                    f"/v1/training-jobs/{job_id}/advance",
+                    json={"stage": "EVALUATE", "evaluation_overrides": {"prompts": ["a red circle"], "seeds": [7], "inference_steps": 1, "guidance_scale": 2}},
+                    headers={**headers, "Idempotency-Key": "advance-evaluate"},
+                )
+                assert response.status_code == 202, response.text
+                wait_for_waiting("PUBLISH")
+                response = client.post(
+                    f"/v1/training-jobs/{job_id}/advance",
+                    json={"stage": "PUBLISH"}, headers={**headers, "Idempotency-Key": "advance-publish"},
+                )
+                assert response.status_code == 202, response.text
             while time.monotonic() < deadline:
                 job = client.get(f"/v1/training-jobs/{job_id}", headers=headers).json()
                 if job["state"] in {"READY", "COMPLETED_UNVERIFIED", "FAILED", "QUALITY_REJECTED"}:
